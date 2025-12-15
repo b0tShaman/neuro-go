@@ -1,953 +1,1175 @@
 package main
 
 import (
-	"bytes"
-	"encoding/gob"
-	"fmt"
-	"image/jpeg"
-	"math"
-	"math/rand"
-	"os"
-	"os/signal"
-	"runtime"
-	"sync"
-	"syscall"
-	"time"
+    "bytes"
+    "encoding/gob"
+    "fmt"
+    "image"
+    "math"
+    "math/rand"
+    "os"
+    "os/signal"
+    "runtime"
+    "sync"
+    "syscall"
+    "time"
 
-	"github.com/b0tShaman/go-rout-net/data"
-	"gonum.org/v1/gonum/floats"
-	"gonum.org/v1/gonum/mat"
+    "github.com/b0tShaman/go-rout-net/data"
+    "golang.org/x/image/draw"
+    "gonum.org/v1/gonum/floats"
+    "gonum.org/v1/gonum/mat"
 )
-
-// --- Matrix Library ---
-
-// Matrix represents a dense matrix with a flat data slice for performance.
-type Matrix struct {
-	rows, cols int
-	data       []float64
-	dense      *mat.Dense
-}
-
-func NewMatrix(rows, cols int) *Matrix {
-	data := make([]float64, rows*cols)
-	return &Matrix{
-		rows:  rows,
-		cols:  cols,
-		data:  data,
-		dense: mat.NewDense(rows, cols, data),
-	}
-}
-
-func NewMatrixFromSlice(rows, cols int, data []float64) *Matrix {
-	if len(data) != rows*cols {
-		panic("Slice length mismatch")
-	}
-
-	return &Matrix{
-		rows:  rows,
-		cols:  cols,
-		data:  data,
-		dense: mat.NewDense(rows, cols, data),
-	}
-}
-
-func (m *Matrix) GobEncode() ([]byte, error) {
-	w := new(bytes.Buffer)
-	encoder := gob.NewEncoder(w)
-	if err := encoder.Encode(m.rows); err != nil {
-		return nil, err
-	}
-	if err := encoder.Encode(m.cols); err != nil {
-		return nil, err
-	}
-	if err := encoder.Encode(m.data); err != nil {
-		return nil, err
-	}
-	return w.Bytes(), nil
-}
-
-func (m *Matrix) GobDecode(buf []byte) error {
-	r := bytes.NewBuffer(buf)
-	decoder := gob.NewDecoder(r)
-	if err := decoder.Decode(&m.rows); err != nil {
-		return err
-	}
-	if err := decoder.Decode(&m.cols); err != nil {
-		return err
-	}
-	if err := decoder.Decode(&m.data); err != nil {
-		return err
-	}
-
-	// Re-create the wrapper after loading data
-	m.dense = mat.NewDense(m.rows, m.cols, m.data)
-
-	return nil
-}
-
-func (m *Matrix) Randomize() {
-	scale := math.Sqrt(2.0 / float64(m.rows))
-	for i := range m.data {
-		m.data[i] = rand.NormFloat64() * scale
-	}
-}
-
-func (m *Matrix) Reset() {
-	for i := range m.data {
-		m.data[i] = 0.0
-	}
-}
-
-// Add performs element-wise addition: m = m + b
-func (m *Matrix) Add(b *Matrix) {
-	// Safety check (optional for raw speed, but good for debugging)
-	if len(m.data) != len(b.data) {
-		panic("Matrix shape mismatch in Add")
-	}
-
-	// floats.Add(dst, src) -> dst[i] += src[i]
-	floats.Add(m.data, b.data)
-}
-
-// Subtract performs element-wise subtraction: m = m - b
-func (m *Matrix) Subtract(b *Matrix) {
-	if len(m.data) != len(b.data) {
-		panic("Matrix shape mismatch in Subtract")
-	}
-
-	// floats.Sub(dst, src) -> dst[i] -= src[i]
-	floats.Sub(m.data, b.data)
-}
-
-// Transpose transposes 'm' into 'dst'.
-// 'dst' must be pre-allocated with dimensions (m.cols x m.rows).
-func (m *Matrix) Transpose(dst *Matrix) {
-	// Safety check (can be removed in production for speed)
-	if dst.rows != m.cols || dst.cols != m.rows {
-		panic(fmt.Sprintf("Shape mismatch in Transpose: Src(%d,%d) vs Dst(%d,%d)",
-			m.rows, m.cols, dst.rows, dst.cols))
-	}
-
-	// Standard cache-unfriendly loop (hard to optimize without blocking)
-	for i := 0; i < m.rows; i++ {
-		rowOffset := i * m.cols
-		for j := 0; j < m.cols; j++ {
-			dst.data[j*dst.cols+i] = m.data[rowOffset+j]
-		}
-	}
-}
-
-func (m *Matrix) AddVector(v *Matrix) {
-	for i := 0; i < m.rows; i++ {
-		for j := 0; j < m.cols; j++ {
-			m.data[i*m.cols+j] += v.data[j]
-		}
-	}
-}
-
-func (m *Matrix) ApplyFunc(fn func(float64) float64) {
-	for i := range m.data {
-		m.data[i] = fn(m.data[i])
-	}
-}
-
-// Optimized MatMul
-func MatMul(a, b, out *Matrix) {
-	// No allocations here anymore
-	out.dense.Mul(a.dense, b.dense)
-}
-
-// MatMul using pure go (no BLAS)
-const blockSize = 64
-
-func MatMulGo(a, b, out *Matrix) {
-	if a.cols != b.rows || out.rows != a.rows || out.cols != b.cols {
-		panic("Shape mismatch")
-	}
-	out.Reset()
-	for i := 0; i < a.rows; i += blockSize {
-		for j := 0; j < b.cols; j += blockSize {
-			for k := 0; k < a.cols; k += blockSize {
-				iMax, jMax, kMax := i+blockSize, j+blockSize, k+blockSize
-				if iMax > a.rows {
-					iMax = a.rows
-				}
-				if jMax > b.cols {
-					jMax = b.cols
-				}
-				if kMax > a.cols {
-					kMax = a.cols
-				}
-				for ii := i; ii < iMax; ii++ {
-					rowOffsetOut := ii * out.cols
-					for kk := k; kk < kMax; kk++ {
-						scalar := a.data[ii*a.cols+kk]
-						rowOffsetB := kk * b.cols
-						for jj := j; jj < jMax; jj++ {
-							out.data[rowOffsetOut+jj] += scalar * b.data[rowOffsetB+jj]
-						}
-					}
-				}
-			}
-		}
-	}
-}
-
-func flatten(input [][]float64) []float64 {
-	if len(input) == 0 {
-		return nil
-	}
-	rows, cols := len(input), len(input[0])
-	flat := make([]float64, rows*cols)
-	for i, row := range input {
-		copy(flat[i*cols:], row)
-	}
-	return flat
-}
-
-func Relu(x float64) float64 {
-	if x > 0 {
-		return x
-	}
-	return 0
-}
-
-func ReluDerivative(x float64) float64 {
-	if x > 0 {
-		return 1
-	}
-	return 0
-}
-
-// SoftmaxRow applies softmax to each row of the matrix.
-func SoftmaxRow(m *Matrix) {
-	for i := 0; i < m.rows; i++ {
-		maxVal := -math.MaxFloat64
-		for j := 0; j < m.cols; j++ {
-			if m.data[i*m.cols+j] > maxVal {
-				maxVal = m.data[i*m.cols+j]
-			}
-		}
-		sum := 0.0
-		for j := 0; j < m.cols; j++ {
-			val := math.Exp(m.data[i*m.cols+j] - maxVal)
-			m.data[i*m.cols+j] = val
-			sum += val
-		}
-		for j := 0; j < m.cols; j++ {
-			m.data[i*m.cols+j] /= sum
-		}
-	}
-}
-
-// --- NEW CONFIGURATION INTERFACE ---
-
-type ActivationType int
 
 const (
-	ActNone ActivationType = iota
-	ActRelu
-	ActSoftmax
+    ActLinear ActivationType = iota
+    ActRelu
+    ActSigmoid
+    ActSoftmax
 )
+
+const (
+    OptSGD      OptimizerType = "sgd"
+    OptMomentum OptimizerType = "momentum"
+    OptAdam     OptimizerType = "adam"
+)
+
+var activationMap = map[string]ActivationType{
+    "linear":  ActLinear,
+    "sigmoid": ActSigmoid,
+    "relu":    ActRelu,
+    "softmax": ActSoftmax,
+}
+
+// Default settings generally recommended for Adam
+var DefaultAdamConfig = AdamConfig{
+    Beta1:        0.9,
+    Beta2:        0.999,
+    Epsilon:      1e-8,
+    LearningRate: 0.001,
+}
+
+// -------- TYPE DEFINITIONS -------- //
+type ActivationType int
+type OptimizerType string
+type LayerOption func(*LayerConfig)
 
 // LayerConfig holds the blueprint for a layer
 type LayerConfig struct {
-	Neurons    int
-	IsInput    bool
-	Activation ActivationType
+    Neurons    int
+    IsInput    bool
+    Activation ActivationType
+}
+
+type LayerState struct {
+    // Moving averages for Weights
+    mW *Matrix
+    vW *Matrix
+
+    // Moving averages for Biases
+    mB *Matrix
+    vB *Matrix
 }
 
 type Layer struct {
-	// Parameters (Shared among workers)
-	Weights *Matrix
-	Biases  *Matrix
+    Weights *Matrix
+    Biases  *Matrix
 
-	// Forward State (Unique to worker)
-	Z *Matrix
-	A *Matrix
+    // Forward State
+    Z *Matrix
+    A *Matrix
 
-	// Backward Scratchpads (Unique to worker)
-	// We pre-allocate these to avoid allocating them 60,000 times!
-	dZ       *Matrix // Error signal for this layer
-	AT       *Matrix // Transposed A (for dW calc)
-	WeightsT *Matrix // Transposed Weights (for previous dZ calc)
-
-	// Configuration
-	ActType ActivationType // Store the activation type here
+    // Backward State
+    dZ      *Matrix
+    ActType ActivationType
 }
 
-// Input defines the entry point dimensions
-func Input(size int) LayerConfig {
-	return LayerConfig{
-		Neurons:    size,
-		IsInput:    true,
-		Activation: ActNone,
-	}
-}
-
-// Dense defines a fully connected layer.
-// By default, we use ReLU. The builder logic will override the LAST layer to Softmax
-// if not specified, or we can handle it explicitly.
-func Dense(size int) LayerConfig {
-	return LayerConfig{
-		Neurons:    size,
-		IsInput:    false,
-		Activation: ActRelu, // Default for hidden layers
-	}
+type NeuralNetwork struct {
+    Layers       []*Layer
+    LearningRate float64
+    InputT       *Matrix
+    InputBuf     *Matrix
 }
 
 // GradientSet holds the calculated gradients for one layer
 type GradientSet struct {
-	dW *Matrix
-	db *Matrix
+    dW *Matrix
+    db *Matrix
 }
 
-// --- Neural Network ---
-
-type NeuralNetwork struct {
-	Layers       []*Layer
-	LearningRate float64
-	InputT       *Matrix
-	InputBuf     *Matrix // <--- Reusable Input Wrapper
+type Optimizer interface {
+    Update(nw *NeuralNetwork, grads []GradientSet)
 }
 
-// NewNetwork is the new Constructor using the variadic interface
-func NewNetwork(lr float64, configs ...LayerConfig) *NeuralNetwork {
-	if len(configs) < 2 {
-		panic("Network must have at least Input and one Output layer")
-	}
-	if !configs[0].IsInput {
-		panic("First layer must be Input()")
-	}
-
-	nn := &NeuralNetwork{LearningRate: lr}
-
-	// Track the output size of the previous layer
-	prevOutputSize := configs[0].Neurons
-
-	for i := 1; i < len(configs); i++ {
-		cfg := configs[i]
-
-		// If it's the very last layer, force Softmax (or let user decide,
-		// but for this specific code which uses CrossEntropy logic, Softmax is required).
-		act := cfg.Activation
-		if i == len(configs)-1 {
-			act = ActSoftmax
-		}
-
-		layer := &Layer{
-			Weights: NewMatrix(prevOutputSize, cfg.Neurons),
-			Biases:  NewMatrix(1, cfg.Neurons),
-			ActType: act,
-		}
-
-		layer.Weights.Randomize()
-		nn.Layers = append(nn.Layers, layer)
-
-		// Update for next iteration
-		prevOutputSize = cfg.Neurons
-	}
-
-	return nn
+type AdamConfig struct {
+    Beta1        float64
+    Beta2        float64
+    Epsilon      float64
+    LearningRate float64
 }
 
-func (nn *NeuralNetwork) CloneStructure() *NeuralNetwork {
-	newNN := &NeuralNetwork{
-		LearningRate: nn.LearningRate,
-		Layers:       make([]*Layer, len(nn.Layers)),
-	}
-	for i, l := range nn.Layers {
-		newNN.Layers[i] = &Layer{
-			Weights: l.Weights,
-			Biases:  l.Biases,
-			ActType: l.ActType, // Copy activation type
-		}
-	}
-	return newNN
+type AdamOptimizer struct {
+    cfg         AdamConfig
+    layerStates []LayerState
+    timeStep    int // 't' in the Adam paper, tracks number of updates
 }
 
-func (nn *NeuralNetwork) InitializeBuffers(batchSize int) {
-	inputDim := nn.Layers[0].Weights.rows
+type SGDOptimizer struct {
+    LearningRate float64
+}
 
-	// FIX: Manually initialize 'dense' here
-	data := make([]float64, batchSize*inputDim)
-	nn.InputBuf = &Matrix{
-		rows:  batchSize,
-		cols:  inputDim,
-		data:  data,
-		dense: mat.NewDense(batchSize, inputDim, data), // <--- ADD THIS
-	}
+type MomentumOptimizer struct {
+    LearningRate float64
+    Mu           float64
+    velocities   [][]GradientSet // State: vW, vB per layer
+}
 
-	nn.InputT = NewMatrix(inputDim, batchSize)
+type TrainingConfig struct {
+    Epochs       int
+    BatchSize    int
+    LearningRate float64
+    ModelPath    string
+    NumWorkers   int
 
-	for _, layer := range nn.Layers {
-		// These use NewMatrix, so they are safe IF NewMatrix is updated
-		layer.Z = NewMatrix(batchSize, layer.Weights.cols)
-		layer.A = NewMatrix(batchSize, layer.Weights.cols)
-		layer.dZ = NewMatrix(batchSize, layer.Weights.cols)
-		layer.AT = NewMatrix(layer.Weights.cols, batchSize)
-		layer.WeightsT = NewMatrix(layer.Weights.cols, layer.Weights.rows)
-	}
+    // Optimizer Selection
+    Optimizer OptimizerType
+
+    // Optimizer Hyperparameters (Zero values will use defaults)
+    MomentumMu float64 // For Momentum (usually 0.9)
+    AdamBeta1  float64 // For Adam (usually 0.9)
+    AdamBeta2  float64 // For Adam (usually 0.999)
+    AdamEps    float64 // For Adam (usually 1e-8)
+}
+
+// Matrix represents a dense matrix with a flat data slice for performance.
+type Matrix struct {
+    rows, cols int
+    data       []float64
+    dense      *mat.Dense
+}
+
+// -------- CONSTRUCTORS ------- //
+func NewMatrix(rows, cols int) *Matrix {
+    data := make([]float64, rows*cols)
+    return &Matrix{
+        rows:  rows,
+        cols:  cols,
+        data:  data,
+        dense: mat.NewDense(rows, cols, data),
+    }
+}
+
+func NewMatrixFromSlice(rows, cols int, data []float64) *Matrix {
+    if len(data) != rows*cols {
+        panic("Slice length mismatch")
+    }
+
+    return &Matrix{
+        rows:  rows,
+        cols:  cols,
+        data:  data,
+        dense: mat.NewDense(rows, cols, data),
+    }
+}
+
+// Neural Network Builder
+func NewNetwork(configs ...LayerConfig) *NeuralNetwork {
+    if len(configs) < 2 {
+        panic("Network must have at least Input and one Output layer")
+    }
+    if !configs[0].IsInput {
+        panic("First layer must be Input()")
+    }
+
+    nn := &NeuralNetwork{}
+
+    // Track the output size of the previous layer
+    prevOutputSize := configs[0].Neurons
+
+    for i := 1; i < len(configs); i++ {
+        cfg := configs[i]
+        act := cfg.Activation
+
+        layer := &Layer{
+            Weights: NewMatrix(prevOutputSize, cfg.Neurons),
+            Biases:  NewMatrix(1, cfg.Neurons),
+            ActType: act,
+        }
+
+        layer.Weights.Randomize()
+        nn.Layers = append(nn.Layers, layer)
+
+        // Update for next iteration
+        prevOutputSize = cfg.Neurons
+    }
+
+    return nn
+}
+
+func NewOptimizer(nw *NeuralNetwork, cfg TrainingConfig) Optimizer {
+    switch cfg.Optimizer {
+    case OptAdam:
+        // Set defaults if 0
+        beta1 := cfg.AdamBeta1
+        if beta1 == 0 {
+            beta1 = 0.9
+        }
+        beta2 := cfg.AdamBeta2
+        if beta2 == 0 {
+            beta2 = 0.999
+        }
+        eps := cfg.AdamEps
+        if eps == 0 {
+            eps = 1e-8
+        }
+
+        adamCfg := AdamConfig{
+            Beta1:        beta1,
+            Beta2:        beta2,
+            Epsilon:      eps,
+            LearningRate: cfg.LearningRate,
+        }
+        return NewAdamOptimizer(nw, adamCfg)
+
+    case OptMomentum:
+        return NewMomentumOptimizer(nw, cfg.LearningRate, cfg.MomentumMu)
+
+    case OptSGD:
+        return &SGDOptimizer{LearningRate: cfg.LearningRate}
+
+    default:
+        return &SGDOptimizer{LearningRate: cfg.LearningRate}
+    }
+}
+
+func NewAdamOptimizer(nw *NeuralNetwork, cfg AdamConfig) *AdamOptimizer {
+    opt := &AdamOptimizer{
+        cfg:      cfg,
+        timeStep: 0,
+    }
+
+    // Initialize zero-matrices for every layer's parameters
+    for _, layer := range nw.Layers {
+        state := LayerState{
+            mW: NewMatrix(layer.Weights.rows, layer.Weights.cols),
+            vW: NewMatrix(layer.Weights.rows, layer.Weights.cols),
+            mB: NewMatrix(layer.Biases.rows, layer.Biases.cols),
+            vB: NewMatrix(layer.Biases.rows, layer.Biases.cols),
+        }
+        // Ensure they start at zero (NewMatrix usually does this, but being explicit helps)
+        state.mW.Reset()
+        state.vW.Reset()
+        state.mB.Reset()
+        state.vB.Reset()
+
+        opt.layerStates = append(opt.layerStates, state)
+    }
+
+    return opt
+}
+
+func NewMomentumOptimizer(nw *NeuralNetwork, lr, mu float64) *MomentumOptimizer {
+    if mu == 0 {
+        mu = 0.9
+    } // Default
+
+    opt := &MomentumOptimizer{
+        LearningRate: lr,
+        Mu:           mu,
+        velocities:   make([][]GradientSet, len(nw.Layers)),
+    }
+
+    for i, layer := range nw.Layers {
+        opt.velocities[i] = make([]GradientSet, 1)
+        opt.velocities[i][0].dW = NewMatrix(layer.Weights.rows, layer.Weights.cols)
+        opt.velocities[i][0].db = NewMatrix(layer.Biases.rows, layer.Biases.cols)
+    }
+    return opt
+}
+
+// -------- MAIN -------- //
+func main() {
+    // Hardware Setup
+    G := runtime.GOMAXPROCS(runtime.NumCPU())
+    modelFile := "assets/model.gob"
+
+    // 1. Load Data
+    fmt.Println("Loading dataset...")
+    X_raw, Y_raw, err := data.LoadCSV("assets/mnist_train.csv")
+    if err != nil {
+        panic("Failed to load data: " + err.Error())
+    }
+
+    // Normalize Input Data
+    for i := range X_raw {
+        for j := range X_raw[i] {
+            X_raw[i][j] /= 255.0
+        }
+    }
+
+    // Create Global Matrix (Zero Copy)
+    X_global := NewMatrixFromSlice(len(X_raw), len(X_raw[0]), flatten(X_raw))
+    inputDim := len(X_raw[0])
+
+    // 2. Initialize Network
+    nw := NewNetwork(
+        Input(inputDim),
+        Dense(64),
+        Dense(32),
+        Dense(16),
+        Dense(10, Activation("softmax")),
+    )
+
+    // Auto-Load weights if they exist
+    if _, err := os.Stat(modelFile); err == nil {
+        fmt.Println("Found existing model. Loading weights...")
+        nw.LoadFromFile(modelFile)
+    }
+
+    // 3. Configure & Train
+    config := TrainingConfig{
+        Epochs:       20,
+        BatchSize:    G * 16,
+        LearningRate: 0.1, // Adam default is 0.001, SGD can be higher
+        ModelPath:    modelFile,
+        NumWorkers:   G,
+        Optimizer:    OptSGD,
+        MomentumMu:   0.9, // Only used if OptMomentum is selected
+    }
+
+    fmt.Printf("Running on %d cores (Mini-Batch = %d)\n\n", runtime.GOMAXPROCS(0), config.BatchSize)
+
+    // Run Training
+    nw.Train(X_global, Y_raw, config)
+
+    // 4. Run Inference
+    nw.InferenceImg("assets/5.jpg")
+}
+
+// -------- NEURAL NETWORK METHODS -------- //
+func (nw *NeuralNetwork) Train(X_global *Matrix, Y_raw []float64, cfg TrainingConfig) {
+    fmt.Printf("TrainingConfig: %+v\n", cfg)
+
+    if cfg.BatchSize%cfg.NumWorkers != 0 {
+        panic("BatchSize must be divisible by NumWorkers")
+    }
+
+    // Create the chosen optimizer
+    optimizer := NewOptimizer(nw, cfg)
+
+    localBatchSize := cfg.BatchSize / cfg.NumWorkers
+    inputDim := X_global.cols
+    numSamples := X_global.rows
+
+    // 1. PRE-ALLOCATE WORKER MEMORY
+    workers := make([]*NeuralNetwork, cfg.NumWorkers)
+    workerGrads := make([][]GradientSet, cfg.NumWorkers)
+
+    fmt.Printf("Initializing %d workers (Local Batch: %d)\n", cfg.NumWorkers, localBatchSize)
+
+    for i := 0; i < cfg.NumWorkers; i++ {
+        workers[i] = nw.CloneStructure()
+        workers[i].InitializeBuffers(localBatchSize)
+
+        workerGrads[i] = make([]GradientSet, len(nw.Layers))
+        for l := 0; l < len(nw.Layers); l++ {
+            rows, cols := nw.Layers[l].Weights.rows, nw.Layers[l].Weights.cols
+            workerGrads[i][l].dW = NewMatrix(rows, cols)
+            workerGrads[i][l].db = NewMatrix(1, cols)
+        }
+    }
+
+    // 2. MASTER GRADIENT BUFFER
+    finalGrads := make([]GradientSet, len(nw.Layers))
+    for l := 0; l < len(nw.Layers); l++ {
+        rows, cols := nw.Layers[l].Weights.rows, nw.Layers[l].Weights.cols
+        finalGrads[l].dW = NewMatrix(rows, cols)
+        finalGrads[l].db = NewMatrix(1, cols)
+    }
+
+    // 3. AUXILIARY BUFFERS
+    globalIndices := NewIndexList(numSamples)
+
+    // Label buffers (avoid alloc inside loop)
+    workerLabels := make([][]float64, cfg.NumWorkers)
+    for i := 0; i < cfg.NumWorkers; i++ {
+        workerLabels[i] = make([]float64, localBatchSize)
+    }
+
+    // Stats buffers
+    workerLosses := make([]float64, cfg.NumWorkers)
+    workerAccs := make([]float64, cfg.NumWorkers)
+
+    // 4. SIGNAL HANDLING (Ctrl+C)
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+    go func() {
+        <-sigChan
+        fmt.Println("\n\nInterrupt received! Saving model...")
+        nw.SaveToFile(cfg.ModelPath)
+        os.Exit(0)
+    }()
+
+    // 5. TRAINING LOOP
+    start := time.Now()
+    fmt.Println("Starting Training...")
+
+    for epoch := 1; epoch <= cfg.Epochs; epoch++ {
+        ShuffleIndices(globalIndices)
+
+        var totalLoss, totalAcc float64
+        batchesProcessed := 0
+
+        for batchStart := 0; batchStart+cfg.BatchSize <= numSamples; batchStart += cfg.BatchSize {
+            var wg sync.WaitGroup
+            wg.Add(cfg.NumWorkers)
+
+            // A. Dispatch Workers
+            for i := 0; i < cfg.NumWorkers; i++ {
+                go func(id int) {
+                    defer wg.Done()
+
+                    // Calc indices
+                    wStart := batchStart + (id * localBatchSize)
+                    wEnd := wStart + localBatchSize
+                    myIndices := globalIndices[wStart:wEnd]
+
+                    // Gather Data
+                    Gather(myIndices, X_global.data, Y_raw, inputDim, workers[id].InputBuf, workerLabels[id])
+
+                    // Compute
+                    workers[id].Forward(workers[id].InputBuf)
+                    loss, acc := workers[id].ComputeGradients(workers[id].InputBuf, workerLabels[id], workerGrads[id])
+
+                    workerLosses[id] = loss
+                    workerAccs[id] = acc
+                }(i)
+            }
+            wg.Wait()
+
+            // B. Aggregate Gradients (Optimized Copy+Add)
+            for l := range finalGrads {
+                finalDW := finalGrads[l].dW
+                finalDB := finalGrads[l].db
+
+                // 1. Copy Worker 0 (Fastest init)
+                copy(finalDW.data, workerGrads[0][l].dW.data)
+                copy(finalDB.data, workerGrads[0][l].db.data)
+
+                // 2. Add remaining workers
+                for w := 1; w < cfg.NumWorkers; w++ {
+                    floats.Add(finalDW.data, workerGrads[w][l].dW.data)
+                    floats.Add(finalDB.data, workerGrads[w][l].db.data)
+                }
+            }
+
+            // C. Update Weights
+            // scale := 1.0 / float64(cfg.NumWorkers)
+            // nw.UpdateWeights(finalGrads, scale)
+            scale := 1.0 / float64(cfg.NumWorkers)
+
+            for l := range finalGrads {
+                // Apply scaling directly to the gradient matrices before passing to Adam
+                floats.Scale(scale, finalGrads[l].dW.data)
+                floats.Scale(scale, finalGrads[l].db.data)
+            }
+
+            optimizer.Update(nw, finalGrads)
+
+            // D. Aggregate Stats
+            for i := range cfg.NumWorkers {
+                totalLoss += workerLosses[i] / float64(cfg.NumWorkers)
+                totalAcc += workerAccs[i] / float64(cfg.NumWorkers)
+            }
+            batchesProcessed++
+        }
+
+        avgLoss := totalLoss / float64(batchesProcessed)
+        avgAcc := (totalAcc / float64(batchesProcessed)) * 100
+        fmt.Printf("Epoch %d | Loss: %.4f | Acc: %.2f%% | Time: %v\n", epoch, avgLoss, avgAcc, time.Since(start))
+    }
+
+    // Save final model
+    nw.SaveToFile(cfg.ModelPath)
+    fmt.Printf("Training Complete. Total Time: %v\n\n", time.Since(start))
+}
+
+func (nw *NeuralNetwork) InferenceImg(imagePath string) {
+    fmt.Printf("Running Inference on: %s\n", imagePath)
+
+    // 1. Load & Convert
+    pixelData, err := convertJpg1D(imagePath, 28, 28)
+    if err != nil {
+        fmt.Printf("Error loading image: %v\n", err)
+        return
+    }
+
+    // 2. Normalize (0-255 -> 0.0-1.0)
+    for i := range pixelData {
+        pixelData[i] = pixelData[i] / 255.0
+    }
+
+    // 3. Predict
+    prediction, confidence := nw.Predict(pixelData)
+
+    fmt.Printf("Predicted Digit: %d\n", prediction)
+    fmt.Printf("Confidence: %.2f%%\n", confidence*100)
+}
+
+func (m *Matrix) GobEncode() ([]byte, error) {
+    w := new(bytes.Buffer)
+    encoder := gob.NewEncoder(w)
+    if err := encoder.Encode(m.rows); err != nil {
+        return nil, err
+    }
+    if err := encoder.Encode(m.cols); err != nil {
+        return nil, err
+    }
+    if err := encoder.Encode(m.data); err != nil {
+        return nil, err
+    }
+    return w.Bytes(), nil
+}
+
+func (m *Matrix) GobDecode(buf []byte) error {
+    r := bytes.NewBuffer(buf)
+    decoder := gob.NewDecoder(r)
+    if err := decoder.Decode(&m.rows); err != nil {
+        return err
+    }
+    if err := decoder.Decode(&m.cols); err != nil {
+        return err
+    }
+    if err := decoder.Decode(&m.data); err != nil {
+        return err
+    }
+
+    // Re-create the wrapper after loading data
+    m.dense = mat.NewDense(m.rows, m.cols, m.data)
+
+    return nil
+}
+
+func (nw *NeuralNetwork) InitializeBuffers(batchSize int) {
+    inputDim := nw.Layers[0].Weights.rows
+    data := make([]float64, batchSize*inputDim)
+    nw.InputBuf = &Matrix{
+        rows:  batchSize,
+        cols:  inputDim,
+        data:  data,
+        dense: mat.NewDense(batchSize, inputDim, data),
+    }
+
+    nw.InputT = NewMatrix(inputDim, batchSize)
+
+    for _, layer := range nw.Layers {
+        layer.Z = NewMatrix(batchSize, layer.Weights.cols)
+        layer.A = NewMatrix(batchSize, layer.Weights.cols)
+        layer.dZ = NewMatrix(batchSize, layer.Weights.cols)
+    }
+}
+
+func (nw *NeuralNetwork) CloneStructure() *NeuralNetwork {
+    newNN := &NeuralNetwork{
+        LearningRate: nw.LearningRate,
+        Layers:       make([]*Layer, len(nw.Layers)),
+    }
+    for i, l := range nw.Layers {
+        newNN.Layers[i] = &Layer{
+            Weights: l.Weights,
+            Biases:  l.Biases,
+            ActType: l.ActType, // Copy activation type
+        }
+    }
+    return newNN
 }
 
 // Optimized Forward with Activation Switch
-func (nn *NeuralNetwork) Forward(input *Matrix) {
-	activation := input
-	for _, layer := range nn.Layers {
-		MatMul(activation, layer.Weights, layer.Z)
-		layer.Z.AddVector(layer.Biases)
+func (nw *NeuralNetwork) Forward(input *Matrix) {
+    activation := input
+    for _, layer := range nw.Layers {
+        MatMul(activation.dense, layer.Weights.dense, layer.Z)
 
-		// Direct copy Z -> A
-		copy(layer.A.data, layer.Z.data)
+        layer.Z.AddVector(layer.Biases)
+        copy(layer.A.data, layer.Z.data)
 
-		// Apply Activation based on ActType
-		switch layer.ActType {
-		case ActSoftmax:
-			SoftmaxRow(layer.A)
-		case ActRelu:
-			layer.A.ApplyFunc(Relu)
-		case ActNone:
-			// Linear activation (pass through)
-		}
-
-		activation = layer.A
-	}
+        switch layer.ActType {
+        case ActSoftmax:
+            SoftmaxRow(layer.A)
+        case ActRelu:
+            layer.A.ApplyRelu()
+        case ActSigmoid:
+            layer.A.ApplySigmoid()
+        case ActLinear:
+        default:
+            panic("Unknown activation type")
+        }
+        activation = layer.A
+    }
 }
 
-// ComputeGradients remains largely the same, assuming CrossEntropy+Softmax at the end.
-func (nn *NeuralNetwork) ComputeGradients(input *Matrix, Y []float64, grads []GradientSet) (float64, float64) {
-	loss, acc := nn.ComputeLossAndAccuracy(Y)
+func (nw *NeuralNetwork) ComputeGradients(input *Matrix, Y []float64, grads []GradientSet) (float64, float64) {
+    loss, acc := nw.ComputeLossAndAccuracy(Y)
 
-	batchSize := float64(input.rows)
-	scale := 1.0 / batchSize
+    batchSize := float64(input.rows)
+    scale := 1.0 / batchSize
 
-	lastLayerIdx := len(nn.Layers) - 1
-	lastLayer := nn.Layers[lastLayerIdx]
+    lastLayerIdx := len(nw.Layers) - 1
+    lastLayer := nw.Layers[lastLayerIdx]
 
-	// 1. Output Error (Assumes Softmax + Cross Entropy)
-	copy(lastLayer.dZ.data, lastLayer.A.data)
-	for i, classLabel := range Y {
-		idx := i*lastLayer.dZ.cols + int(classLabel)
-		lastLayer.dZ.data[idx] -= 1.0
-	}
+    // 1. Output Error (Softmax + CrossEntropy)
+    if lastLayer.ActType == ActSoftmax {
+        copy(lastLayer.dZ.data, lastLayer.A.data)
+        for i, classLabel := range Y {
+            idx := i*lastLayer.dZ.cols + int(classLabel)
+            lastLayer.dZ.data[idx] -= 1.0
+        }
+    } else {
+        panic("Only Softmax output layer is currently supported")
+    }
 
-	// 2. Backprop
-	for i := lastLayerIdx; i >= 0; i-- {
-		layer := nn.Layers[i]
-		var A_prev *Matrix
-		if i == 0 {
-			A_prev = input
-		} else {
-			A_prev = nn.Layers[i-1].A
-		}
+    // 2. Backprop Loop
+    for i := lastLayerIdx; i >= 0; i-- {
+        layer := nw.Layers[i]
 
-		// dW
-		if i > 0 {
-			prevLayer := nn.Layers[i-1]
-			A_prev.Transpose(prevLayer.AT)
-			MatMul(prevLayer.AT, layer.dZ, grads[i].dW)
-		} else {
-			A_prev.Transpose(nn.InputT)
-			MatMul(nn.InputT, layer.dZ, grads[i].dW)
-		}
+        // Determine A_prev (The input to this layer)
+        var A_prev_dense mat.Matrix // Interface type
+        if i == 0 {
+            A_prev_dense = input.dense
+        } else {
+            A_prev_dense = nw.Layers[i-1].A.dense
+        }
 
-		// db
-		grads[i].db.Reset()
-		dZData := layer.dZ.data
-		dbData := grads[i].db.data
-		cols := layer.dZ.cols
-		for r := 0; r < layer.dZ.rows; r++ {
-			rowOffset := r * cols
-			for c := 0; c < cols; c++ {
-				dbData[c] += dZData[rowOffset+c]
-			}
-		}
+        // --- CALC dW ---
+        if i > 0 {
+            // dW = A_prev.T * dZ
+            MatMul(A_prev_dense.T(), layer.dZ.dense, grads[i].dW)
+        } else {
+            // Special case for input layer
+            MatMul(input.dense.T(), layer.dZ.dense, grads[i].dW)
+        }
 
-		// Scale
-		grads[i].dW.ApplyFunc(func(v float64) float64 { return v * scale })
-		grads[i].db.ApplyFunc(func(v float64) float64 { return v * scale })
+        // --- CALC db ---
+        grads[i].db.Reset()
+        dZData := layer.dZ.data
+        dbData := grads[i].db.data
+        cols := layer.dZ.cols
+        for r := 0; r < layer.dZ.rows; r++ {
+            rowOffset := r * cols
+            for c := 0; c < cols; c++ {
+                dbData[c] += dZData[rowOffset+c]
+            }
+        }
 
-		// dZ Prev
-		if i > 0 {
-			prevLayer := nn.Layers[i-1]
-			layer.Weights.Transpose(layer.WeightsT)
-			MatMul(layer.dZ, layer.WeightsT, prevLayer.dZ)
+        // Apply Scale
+        grads[i].dW.ApplyFunc(func(v float64) float64 { return v * scale })
+        grads[i].db.ApplyFunc(func(v float64) float64 { return v * scale })
 
-			// Derivative Application depends on Previous Layer's Activation
-			// Since we defaulted internal layers to Relu, we use Relu Derivative.
-			// If you add other activations, add a switch here too.
-			zData := prevLayer.Z.data
-			dZPrevData := prevLayer.dZ.data
-			for k := range dZPrevData {
-				// Logic: error = error * derivative(input)
-				dZPrevData[k] *= ReluDerivative(zData[k])
-				// Uncomment to avoid loading ReluDerivative function
-				// if zData[k] <= 0 {
-				// 	dZPrevData[k] = 0
-				// }
-			}
-		}
-	}
-	return loss, acc
+        // floats.Scale(scale, grads[i].dW.data) -> this would be faster
+        // floats.Scale(scale, grads[i].db.data)
+
+        // --- CALC dZ_prev ---
+        if i > 0 {
+            prevLayer := nw.Layers[i-1]
+            MatMul(layer.dZ.dense, layer.Weights.dense.T(), prevLayer.dZ)
+
+            // Apply Derivative
+            zData := prevLayer.Z.data
+            dZPrevData := prevLayer.dZ.data
+
+            // Note: Since we use slice access for element-wise ops,
+            // we don't need Gonum here. This part stays fast & custom.
+            for k := range dZPrevData {
+                switch prevLayer.ActType {
+                case ActRelu:
+                    if zData[k] <= 0 {
+                        dZPrevData[k] = 0
+                    }
+                case ActSigmoid:
+                    a := prevLayer.A.data[k]
+                    dZPrevData[k] *= a * (1.0 - a)
+                case ActLinear:
+                    // derivative is 1
+                }
+            }
+        }
+    }
+    return loss, acc
 }
 
 // SaveToFile saves the neural network weights and biases to a file.
 // Save/Load logic needs to store the ActivationType now
-func (nn *NeuralNetwork) SaveToFile(filename string) error {
-	file, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	encoder := gob.NewEncoder(file)
+func (nw *NeuralNetwork) SaveToFile(filename string) error {
+    file, err := os.Create(filename)
+    if err != nil {
+        return err
+    }
+    defer file.Close()
+    encoder := gob.NewEncoder(file)
 
-	type LayerData struct {
-		Weights *Matrix
-		Biases  *Matrix
-		ActType ActivationType
-	}
-	type NetworkData struct {
-		LayerDatas   []LayerData
-		LearningRate float64
-	}
+    type LayerData struct {
+        Weights *Matrix
+        Biases  *Matrix
+        ActType ActivationType
+    }
+    type NetworkData struct {
+        LayerDatas   []LayerData
+        LearningRate float64
+    }
 
-	ld := make([]LayerData, len(nn.Layers))
-	for i, l := range nn.Layers {
-		ld[i] = LayerData{Weights: l.Weights, Biases: l.Biases, ActType: l.ActType}
-	}
+    ld := make([]LayerData, len(nw.Layers))
+    for i, l := range nw.Layers {
+        ld[i] = LayerData{Weights: l.Weights, Biases: l.Biases, ActType: l.ActType}
+    }
 
-	return encoder.Encode(NetworkData{LayerDatas: ld, LearningRate: nn.LearningRate})
+    return encoder.Encode(NetworkData{LayerDatas: ld, LearningRate: nw.LearningRate})
 }
 
-func (nn *NeuralNetwork) LoadFromFile(filename string) error {
-	file, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	decoder := gob.NewDecoder(file)
+func (nw *NeuralNetwork) LoadFromFile(filename string) error {
+    file, err := os.Open(filename)
+    if err != nil {
+        return err
+    }
+    defer file.Close()
+    decoder := gob.NewDecoder(file)
 
-	type LayerData struct {
-		Weights *Matrix
-		Biases  *Matrix
-		ActType ActivationType
-	}
-	type NetworkData struct {
-		LayerDatas   []LayerData
-		LearningRate float64
-	}
+    type LayerData struct {
+        Weights *Matrix
+        Biases  *Matrix
+        ActType ActivationType
+    }
+    type NetworkData struct {
+        LayerDatas   []LayerData
+        LearningRate float64
+    }
 
-	var data NetworkData
-	if err := decoder.Decode(&data); err != nil {
-		return err
-	}
+    var data NetworkData
+    if err := decoder.Decode(&data); err != nil {
+        return err
+    }
 
-	nn.Layers = make([]*Layer, len(data.LayerDatas))
-	for i, ld := range data.LayerDatas {
-		nn.Layers[i] = &Layer{
-			Weights: ld.Weights,
-			Biases:  ld.Biases,
-			ActType: ld.ActType,
-		}
-	}
-	nn.LearningRate = data.LearningRate
-	return nil
+    nw.Layers = make([]*Layer, len(data.LayerDatas))
+    for i, ld := range data.LayerDatas {
+        nw.Layers[i] = &Layer{
+            Weights: ld.Weights,
+            Biases:  ld.Biases,
+            ActType: ld.ActType,
+        }
+    }
+    nw.LearningRate = data.LearningRate
+    return nil
 }
 
-func (nn *NeuralNetwork) ComputeLossAndAccuracy(Y []float64) (float64, float64) {
-	output := nn.Layers[len(nn.Layers)-1].A
-	totalLoss := 0.0
-	correctCount := 0
-	epsilon := 1e-15
+func (nw *NeuralNetwork) ComputeLossAndAccuracy(Y []float64) (float64, float64) {
+    output := nw.Layers[len(nw.Layers)-1].A
+    totalLoss := 0.0
+    correctCount := 0
+    epsilon := 1e-15
 
-	for i := 0; i < output.rows; i++ {
-		maxProb := -1.0
-		predictedClass := -1
-		targetClass := Y[i]
+    for i := 0; i < output.rows; i++ {
+        maxProb := -1.0
+        predictedClass := -1
+        targetClass := Y[i]
 
-		for j := 0; j < output.cols; j++ {
-			prob := output.data[i*output.cols+j]
-			if prob > maxProb {
-				maxProb = prob
-				predictedClass = j
-			}
-			if j == int(targetClass) {
-				totalLoss += -math.Log(prob + epsilon)
-			}
-		}
-		if predictedClass == int(targetClass) {
-			correctCount++
-		}
-	}
-	return totalLoss / float64(output.rows), float64(correctCount) / float64(output.rows)
-}
-
-func (nn *NeuralNetwork) UpdateWeights(aggregatedGrads []GradientSet, splitScale float64) {
-	effectiveLR := nn.LearningRate * splitScale
-
-	for i, layer := range nn.Layers {
-		gradW, gradB := aggregatedGrads[i].dW, aggregatedGrads[i].db
-
-		// 1. Update Weights
-		// Logic: Weights = Weights + (-effectiveLR * gradW)
-		// This runs in one SIMD pass over the whole slice.
-		floats.AddScaledTo(layer.Weights.data, layer.Weights.data, -effectiveLR, gradW.data)
-
-		// 2. Update Biases
-		// Logic: Biases = Biases + (-effectiveLR * gradB)
-		floats.AddScaledTo(layer.Biases.data, layer.Biases.data, -effectiveLR, gradB.data)
-	}
+        for j := 0; j < output.cols; j++ {
+            prob := output.data[i*output.cols+j]
+            if prob > maxProb {
+                maxProb = prob
+                predictedClass = j
+            }
+            if j == int(targetClass) {
+                totalLoss += -math.Log(prob + epsilon)
+            }
+        }
+        if predictedClass == int(targetClass) {
+            correctCount++
+        }
+    }
+    return totalLoss / float64(output.rows), float64(correctCount) / float64(output.rows)
 }
 
 // Predict takes a flattened image (1D slice), passes it through the network,
 // and returns the predicted Class (0-9) and the Confidence (probability).
-func (nn *NeuralNetwork) Predict(inputData []float64) (int, float64) {
-	// 1. Validation
-	inputSize := nn.Layers[0].Weights.rows
-	if len(inputData) != inputSize {
-		panic(fmt.Sprintf("Input size mismatch. Expected %d, got %d", inputSize, len(inputData)))
-	}
+func (nw *NeuralNetwork) Predict(inputData []float64) (int, float64) {
+    // 1. Validation
+    inputSize := nw.Layers[0].Weights.rows
+    if len(inputData) != inputSize {
+        panic(fmt.Sprintf("Input size mismatch. Expected %d, got %d", inputSize, len(inputData)))
+    }
 
-	// Check if buffers exist and match the batch size (1)
-	if nn.Layers[0].Z == nil || nn.Layers[0].Z.rows != 1 {
-		nn.InitializeBuffers(1)
-	}
+    // Check if buffers exist and match the batch size (1)
+    if nw.Layers[0].Z == nil || nw.Layers[0].Z.rows != 1 {
+        nw.InitializeBuffers(1)
+    }
 
-	// 2. Create Matrix View (1 Row, N Cols)
-	// We treat the single image as a Batch of size 1.
-	inputMat := NewMatrixFromSlice(1, inputSize, inputData)
+    // Create Matrix View (1 Row, N Cols)
+    // We treat the single image as a Batch of size 1.
+    inputMat := NewMatrixFromSlice(1, inputSize, inputData)
 
-	// 3. Run Forward Pass
-	// This updates the Master NN's internal 'A' matrices.
-	nn.Forward(inputMat)
+    // 3. Run Forward Pass
+    nw.Forward(inputMat)
 
-	// 4. Read Output
-	// The result is in the last layer's Activation matrix (A).
-	lastLayer := nn.Layers[len(nn.Layers)-1]
-	probabilities := lastLayer.A.data // This is a slice of size 10 (for MNIST)
+    // 4. Read Output
+    lastLayer := nw.Layers[len(nw.Layers)-1]
+    probabilities := lastLayer.A.data // This is a slice of size 10 (for MNIST)
 
-	// 5. Argmax (Find highest probability)
-	bestClass := -1
-	maxProb := -1.0
+    // 5. Argmax (Find highest probability)
+    bestClass := -1
+    maxProb := -1.0
 
-	for i, prob := range probabilities {
-		if prob > maxProb {
-			maxProb = prob
-			bestClass = i
-		}
-	}
+    for i, prob := range probabilities {
+        if prob > maxProb {
+            maxProb = prob
+            bestClass = i
+        }
+    }
 
-	return bestClass, maxProb
+    return bestClass, maxProb
 }
 
-func convertJpg1D(path string) ([]float64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	img, err := jpeg.Decode(f)
-	if err != nil {
-		return nil, err
-	}
-
-	bounds := img.Bounds()
-	w, h := bounds.Dx(), bounds.Dy()
-
-	out := make([]float64, 0, w*h)
-
-	for y := range h {
-		for x := range w {
-			r, g, b, _ := img.At(x, y).RGBA()
-
-			gray := 0.299*float64(r>>8) +
-				0.587*float64(g>>8) +
-				0.114*float64(b>>8)
-
-			out = append(out, gray)
-		}
-	}
-
-	return out, nil
+// ------- MATRIX METHODS ------ //
+func (m *Matrix) Randomize() {
+    scale := math.Sqrt(2.0 / float64(m.rows))
+    for i := range m.data {
+        m.data[i] = rand.NormFloat64() * scale
+    }
 }
 
-// NewIndexList creates a slice [0, 1, 2, ..., size-1]
+func (m *Matrix) Reset() {
+    for i := range m.data {
+        m.data[i] = 0.0
+    }
+}
+
+func (m *Matrix) Add(b *Matrix) {
+    m.dense.Add(m.dense, b.dense)
+}
+
+func (m *Matrix) Subtract(b *Matrix) {
+    m.dense.Sub(m.dense, b.dense)
+}
+
+func (m *Matrix) AddVector(v *Matrix) {
+    for i := 0; i < m.rows; i++ {
+        for j := 0; j < m.cols; j++ {
+            m.data[i*m.cols+j] += v.data[j]
+        }
+    }
+}
+
+func (m *Matrix) ApplyRelu() {
+    for i, v := range m.data {
+        if v < 0 {
+            m.data[i] = 0
+        }
+    }
+}
+
+func (m *Matrix) ApplySigmoid() {
+    for i, v := range m.data {
+        m.data[i] = 1.0 / (1.0 + math.Exp(-v))
+    }
+}
+
+func (m *Matrix) ApplyFunc(fn func(float64) float64) {
+    for i := range m.data {
+        m.data[i] = fn(m.data[i])
+    }
+}
+
+// ------- LAYER CONFIG HELPERS ------- //
+// Input defines the entry point dimensions
+func Input(size int) LayerConfig {
+    return LayerConfig{
+        Neurons:    size,
+        IsInput:    true,
+        Activation: ActLinear,
+    }
+}
+
+// Dense defines a fully connected layer.
+func Dense(size int, opts ...LayerOption) LayerConfig {
+    d := LayerConfig{
+        Neurons:    size,
+        IsInput:    false,
+        Activation: ActRelu, // Default for hidden layers
+    }
+
+    for _, opt := range opts {
+        opt(&d)
+    }
+    return d
+}
+
+func Activation(activation string) LayerOption {
+    return func(lc *LayerConfig) {
+        act, exists := activationMap[activation]
+        if !exists {
+            panic("Unknown activation: " + activation)
+        }
+        lc.Activation = act
+    }
+}
+
+// ------ ADAM OPTIMIZER METHODS ------ //
+// Update applies the Adam update rule to the network's weights and biases
+func (opt *AdamOptimizer) Update(nw *NeuralNetwork, grads []GradientSet) {
+    opt.timeStep++
+
+    // Pre-calculate bias correction factors for efficiency
+    // correction = 1 / (1 - beta^t)
+    beta1Corr := 1.0 / (1.0 - math.Pow(opt.cfg.Beta1, float64(opt.timeStep)))
+    beta2Corr := 1.0 / (1.0 - math.Pow(opt.cfg.Beta2, float64(opt.timeStep)))
+
+    lr := opt.cfg.LearningRate
+
+    for i, layer := range nw.Layers {
+        state := opt.layerStates[i]
+
+        // Update Weights
+        applyAdam(
+            layer.Weights.data,
+            grads[i].dW.data,
+            state.mW.data,
+            state.vW.data,
+            opt.cfg,
+            lr,
+            beta1Corr,
+            beta2Corr,
+        )
+
+        // Update Biases
+        applyAdam(
+            layer.Biases.data,
+            grads[i].db.data,
+            state.mB.data,
+            state.vB.data,
+            opt.cfg,
+            lr,
+            beta1Corr,
+            beta2Corr,
+        )
+    }
+}
+
+// applyAdam performs the element-wise math over the flat slice.
+func applyAdam(
+    params []float64,
+    grads []float64,
+    m []float64,
+    v []float64,
+    cfg AdamConfig,
+    lr, beta1Corr, beta2Corr float64,
+) {
+    for i := range params {
+        g := grads[i]
+
+        // 1. Update biased first moment estimate (Momentum)
+        // m_t = beta1 * m_{t-1} + (1 - beta1) * g
+        m[i] = cfg.Beta1*m[i] + (1.0-cfg.Beta1)*g
+
+        // 2. Update biased second raw moment estimate (Velocity)
+        // v_t = beta2 * v_{t-1} + (1 - beta2) * g^2
+        v[i] = cfg.Beta2*v[i] + (1.0-cfg.Beta2)*(g*g)
+
+        // 3. Compute bias-corrected moment estimates
+        mHat := m[i] * beta1Corr
+        vHat := v[i] * beta2Corr
+
+        // 4. Update parameters
+        // theta = theta - lr * mHat / (sqrt(vHat) + epsilon)
+        params[i] -= lr * mHat / (math.Sqrt(vHat) + cfg.Epsilon)
+    }
+}
+
+// ------ MOMENTUM OPTIMIZER METHODS ------ //
+func (opt *MomentumOptimizer) Update(nw *NeuralNetwork, grads []GradientSet) {
+    for i, layer := range nw.Layers {
+        vW := opt.velocities[i][0].dW.data
+        vB := opt.velocities[i][0].db.data
+        dW := grads[i].dW.data
+        db := grads[i].db.data
+
+        // Update Velocity: v = mu*v - lr*grad
+        floats.Scale(opt.Mu, vW)
+        floats.AddScaled(vW, -opt.LearningRate, dW)
+
+        floats.Scale(opt.Mu, vB)
+        floats.AddScaled(vB, -opt.LearningRate, db)
+
+        // Update Weights: W = W + v
+        floats.Add(layer.Weights.data, vW)
+        floats.Add(layer.Biases.data, vB)
+    }
+}
+
+// ------ SGD OPTIMIZER METHODS ------ //
+func (opt *SGDOptimizer) Update(nw *NeuralNetwork, grads []GradientSet) {
+    for i, layer := range nw.Layers {
+        // Simple update: W = W - (lr * gradient)
+        floats.AddScaled(layer.Weights.data, -opt.LearningRate, grads[i].dW.data)
+        floats.AddScaled(layer.Biases.data, -opt.LearningRate, grads[i].db.data)
+    }
+}
+
+// ------ UTILITY FUNCTIONS ------
+func MatMul(a, b mat.Matrix, out *Matrix) {
+    out.dense.Mul(a, b)
+}
+
+// MatMul using pure go (no BLAS)
+func MatMulGo(a, b, out *Matrix) {
+    const blockSize = 64
+    if a.cols != b.rows || out.rows != a.rows || out.cols != b.cols {
+        panic("Shape mismatch")
+    }
+    out.Reset()
+    for i := 0; i < a.rows; i += blockSize {
+        for j := 0; j < b.cols; j += blockSize {
+            for k := 0; k < a.cols; k += blockSize {
+                iMax, jMax, kMax := i+blockSize, j+blockSize, k+blockSize
+                if iMax > a.rows {
+                    iMax = a.rows
+                }
+                if jMax > b.cols {
+                    jMax = b.cols
+                }
+                if kMax > a.cols {
+                    kMax = a.cols
+                }
+                for ii := i; ii < iMax; ii++ {
+                    rowOffsetOut := ii * out.cols
+                    for kk := k; kk < kMax; kk++ {
+                        scalar := a.data[ii*a.cols+kk]
+                        rowOffsetB := kk * b.cols
+                        for jj := j; jj < jMax; jj++ {
+                            out.data[rowOffsetOut+jj] += scalar * b.data[rowOffsetB+jj]
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ------ DATA HANDLING HELPERS ------
 func NewIndexList(size int) []int {
-	indices := make([]int, size)
-	for i := range indices {
-		indices[i] = i
-	}
-	return indices
+    indices := make([]int, size)
+    for i := range indices {
+        indices[i] = i
+    }
+    return indices
 }
 
-// ShuffleIndices performs Fisher-Yates on the index slice only.
-// This is extremely fast compared to shuffling the float data.
 func ShuffleIndices(indices []int) {
-	rand.Seed(time.Now().UnixNano())
-	rand.Shuffle(len(indices), func(i, j int) {
-		indices[i], indices[j] = indices[j], indices[i]
-	})
+    rand.Shuffle(len(indices), func(i, j int) {
+        indices[i], indices[j] = indices[j], indices[i]
+    })
 }
 
 // Gather copies specific rows from the global storage into the worker's local buffer.
 // This allows the worker to have a contiguous matrix for efficient MatMul,
 // without needing to reshuffle the global array.
 func Gather(
-	batchIndices []int, // The random indices for this worker (e.g., 16 items)
-	globalX []float64, // The massive immutable data
-	globalY []float64, // The massive immutable labels
-	inputDim int, // e.g., 784
-	destX *Matrix, // The worker's local input matrix
-	destY []float64, // The worker's local label slice
+    batchIndices []int, // The random indices for this worker (e.g., 16 items)
+    globalX []float64, // The massive immutable data
+    globalY []float64, // The massive immutable labels
+    inputDim int, // e.g., 784
+    destX *Matrix, // The worker's local input matrix
+    destY []float64, // The worker's local label slice
 ) {
-	rowSize := inputDim
+    rowSize := inputDim
 
-	for localRowIdx, realDataIdx := range batchIndices {
-		// 1. Copy Label
-		destY[localRowIdx] = globalY[realDataIdx]
+    for localRowIdx, realDataIdx := range batchIndices {
+        // 1. Copy Label
+        destY[localRowIdx] = globalY[realDataIdx]
 
-		// 2. Copy Input Vector
-		// We calculate where this specific image lives in the massive global array
-		srcStart := realDataIdx * rowSize
-		srcEnd := srcStart + rowSize
+        // 2. Copy Input Vector
+        // We calculate where this specific input lives in the massive global array
+        srcStart := realDataIdx * rowSize
+        srcEnd := srcStart + rowSize
 
-		// We calculate where it should go in the worker's small local buffer
-		dstStart := localRowIdx * rowSize
-		dstEnd := dstStart + rowSize
+        // We calculate where it should go in the worker's small local buffer
+        dstStart := localRowIdx * rowSize
+        dstEnd := dstStart + rowSize
 
-		copy(destX.data[dstStart:dstEnd], globalX[srcStart:srcEnd])
-	}
+        copy(destX.data[dstStart:dstEnd], globalX[srcStart:srcEnd])
+    }
 }
 
-func main() {
-	G := runtime.GOMAXPROCS(runtime.NumCPU())
-	fmt.Printf("Running on %d cores (Mini-Batch Mode)\n", runtime.GOMAXPROCS(0))
+func Relu(x float64) float64 {
+    if x > 0 {
+        return x
+    }
+    return 0
+}
 
-	// --- 1. Load Data ---
-	X_raw, Y_raw, err := data.LoadCSV("assets/mnist_train.csv")
-	if err != nil {
-		panic("Failed to load data: " + err.Error())
-	}
-	data.MinMaxNormalize(X_raw)
+func ReluDerivative(x float64) float64 {
+    if x > 0 {
+        return 1
+    }
+    return 0
+}
 
-	inputDim := len(X_raw[0])
-	numSamples := len(X_raw)
+// SoftmaxRow applies softmax to each row of the matrix.
+func SoftmaxRow(m *Matrix) {
+    for i := 0; i < m.rows; i++ {
+        maxVal := -math.MaxFloat64
+        for j := 0; j < m.cols; j++ {
+            if m.data[i*m.cols+j] > maxVal {
+                maxVal = m.data[i*m.cols+j]
+            }
+        }
+        sum := 0.0
+        for j := 0; j < m.cols; j++ {
+            val := math.Exp(m.data[i*m.cols+j] - maxVal)
+            m.data[i*m.cols+j] = val
+            sum += val
+        }
+        for j := 0; j < m.cols; j++ {
+            m.data[i*m.cols+j] /= sum
+        }
+    }
+}
 
-	// Create the single massive backing array (Zero Copy)
-	X_global := NewMatrixFromSlice(len(X_raw), len(X_raw[0]), flatten(X_raw))
+func flatten(input [][]float64) []float64 {
+    if len(input) == 0 {
+        return nil
+    }
+    rows, cols := len(input), len(input[0])
+    flat := make([]float64, rows*cols)
+    for i, row := range input {
+        copy(flat[i*cols:], row)
+    }
+    return flat
+}
 
-	// --- NEW INITIALIZATION SYNTAX ---
-	masterNN := NewNetwork(0.1,
-		Input(inputDim),
-		Dense(64),
-		Dense(32),
-		Dense(16),
-		Dense(10), // Will automatically be treated as Softmax
-	)
+// ------ IMAGE PROCESSING HELPERS ------
+func convertJpg1D(path string, targetW, targetH int) ([]float64, error) {
+    f, err := os.Open(path)
+    if err != nil {
+        return nil, err
+    }
+    defer f.Close()
 
-	// --- 1. Auto-Load Logic ---
-	modelFile := "assets/model.gob"
-	if _, err := os.Stat(modelFile); err == nil {
-		fmt.Println("Found existing model. Loading weights...")
-		if err := masterNN.LoadFromFile(modelFile); err != nil {
-			fmt.Printf("Failed to load model: %v. Starting from scratch.\n", err)
-		} else {
-			fmt.Println("Weights loaded successfully!")
-		}
-	} else {
-		fmt.Println("No existing model found. Starting training from scratch.")
-	}
+    src, _, err := image.Decode(f)
+    if err != nil {
+        return nil, err
+    }
 
-	// --- 2. Graceful Shutdown (Ctrl+C) ---
-	// Create a channel to listen for OS signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+    // Resize to 28x28 (or whatever the network expects)
+    dst := image.NewRGBA(image.Rect(0, 0, targetW, targetH))
+    draw.CatmullRom.Scale(dst, dst.Rect, src, src.Bounds(), draw.Over, nil)
 
-	go func() {
-		<-sigChan // Block here until Ctrl+C is pressed
-		fmt.Println("\n\nInterrupt received! Saving model...")
+    out := make([]float64, 0, targetW*targetH)
+    bounds := dst.Bounds()
 
-		// Save the current state of MasterNN
-		if err := masterNN.SaveToFile(modelFile); err != nil {
-			fmt.Printf("Error saving model: %v\n", err)
-		} else {
-			fmt.Printf("Model saved to %s\n", modelFile)
-		}
-
-		fmt.Println("Exiting.")
-		os.Exit(0)
-	}()
-
-	// --- 2. CONFIGURATION ---
-	BatchSize := G * 16 // 126 //numSamples-10// Standard mini-batch size
-
-	// Ensure BatchSize is divisible by G for simplicity in this example
-	if BatchSize%G != 0 {
-		panic("For this example, please ensure BatchSize is divisible by Core Count (G)")
-	}
-
-	localBatchSize := BatchSize / G // e.g., 128 / 8 = 16 samples per worker
-
-	// --- 3. PRE-ALLOCATE WORKER MEMORY (Small Buffers) ---
-	workers := make([]*NeuralNetwork, G)
-	workerGrads := make([][]GradientSet, G)
-
-	for i := 0; i < G; i++ {
-		// A. Clone Structure
-		workers[i] = masterNN.CloneStructure()
-
-		// B. Allocate Forward Buffers (Z, A)
-		// Crucial: We only allocate enough for the LOCAL mini-batch (small!)
-		workers[i].InitializeBuffers(localBatchSize)
-
-		// C. Allocate Gradient Buffers (Same size as weights)
-		workerGrads[i] = make([]GradientSet, len(masterNN.Layers))
-		for l := 0; l < len(masterNN.Layers); l++ {
-			rows, cols := masterNN.Layers[l].Weights.rows, masterNN.Layers[l].Weights.cols
-			workerGrads[i][l].dW = NewMatrix(rows, cols)
-			workerGrads[i][l].db = NewMatrix(1, cols)
-		}
-	}
-
-	// --- 4. REUSABLE MASTER GRADIENT BUFFER ---
-	finalGrads := make([]GradientSet, len(masterNN.Layers))
-	for l := 0; l < len(masterNN.Layers); l++ {
-		rows, cols := masterNN.Layers[l].Weights.rows, masterNN.Layers[l].Weights.cols
-		finalGrads[l].dW = NewMatrix(rows, cols)
-		finalGrads[l].db = NewMatrix(1, cols)
-	}
-
-	epochs := 20
-	start := time.Now()
-
-	// 1. Create the Master Index List
-	globalIndices := NewIndexList(numSamples)
-
-	// 2. Pre-allocate Worker Label Buffers (to avoid making new slices inside loop)
-	workerLabels := make([][]float64, G)
-	for i := 0; i < G; i++ {
-		workerLabels[i] = make([]float64, localBatchSize)
-	}
-
-	// 3. Re-use performance counters
-	workerLosses := make([]float64, G)
-	workerAccs := make([]float64, G)
-
-	fmt.Println("Starting Training (Optimized Index Shuffling)...")
-
-	for epoch := 1; epoch <= epochs; epoch++ {
-
-		// --- OPTIMIZATION: Shuffle Indices, NOT Data ---
-		ShuffleIndices(globalIndices)
-
-		var totalLoss float64
-		var totalAcc float64 // 1. Add accumulator for epoch accuracy
-		batchesProcessed := 0
-
-		// --- INNER BATCH LOOP ---
-		// We iterate through the data in jumps of BatchSize
-		for batchStart := 0; batchStart+BatchSize <= numSamples; batchStart += BatchSize { // skip last batch if incomplete
-
-			var wg sync.WaitGroup
-			wg.Add(G)
-
-			// Dispatch Workers
-			for i := 0; i < G; i++ {
-				go func(id int) {
-					defer wg.Done()
-
-					// 1. Determine which "Random Indices" this worker handles
-					// The batch indices are contiguous in our shuffled list,
-					// but they point to random locations in the data.
-					wStart := batchStart + (id * localBatchSize)
-					wEnd := wStart + localBatchSize
-
-					// This slice represents the random IDs this worker must process
-					myIndices := globalIndices[wStart:wEnd]
-
-					// 2. GATHER Step
-					// Copy the data from random global locations into local contiguous memory
-					Gather(
-						myIndices,
-						X_global.data,
-						Y_raw,
-						inputDim,
-						workers[id].InputBuf, // Destination Matrix
-						workerLabels[id],     // Destination Label Slice
-					)
-
-					// 3. Forward & Backward (Standard)
-					workers[id].Forward(workers[id].InputBuf)
-
-					loss, acc := workers[id].ComputeGradients(workers[id].InputBuf, workerLabels[id], workerGrads[id])
-
-					workerLosses[id] = loss
-					workerAccs[id] = acc
-				}(i)
-			}
-			wg.Wait()
-
-			// --- AGGREGATION PHASE (Happens every batch!) ---
-
-			// Clear previous
-			for l := 0; l < len(finalGrads); l++ {
-				finalGrads[l].dW.Reset()
-				finalGrads[l].db.Reset()
-			}
-
-			// Sum
-			for _, gSet := range workerGrads {
-				for l := 0; l < len(finalGrads); l++ {
-					finalGrads[l].dW.Add(gSet[l].dW)
-					finalGrads[l].db.Add(gSet[l].db)
-				}
-			}
-
-			// Average and Update IMMEDIATELLY
-			scale := 1.0 / float64(G)
-			masterNN.UpdateWeights(finalGrads, scale)
-
-			// B. Sum up stats from the slice (New code)
-			for i := 0; i < G; i++ {
-				totalLoss += workerLosses[i] / float64(G)
-				totalAcc += workerAccs[i] / float64(G)
-			}
-			batchesProcessed++
-		}
-
-		// 6. Calculate Final Averages
-		avgLoss := totalLoss / float64(batchesProcessed)
-		avgAcc := (totalAcc / float64(batchesProcessed)) * 100 // Convert to percentage
-
-		fmt.Printf("Epoch %d | Loss: %.4f | Acc: %.2f%% | Time: %v\n", epoch, avgLoss, avgAcc, time.Since(start))
-	}
-
-	// ... Inference code ...
-	// [After loop ends]
-	masterNN.SaveToFile(modelFile) // Save on normal completion
-	fmt.Printf("Total Time: %v\n", time.Since(start))
-
-	fmt.Println("Training Complete. Running Inference...")
-
-	// 1. Load Image
-	imagePath := "assets/5.jpg"
-	pixelData, err := convertJpg1D(imagePath)
-	if err != nil {
-		panic(err)
-	}
-
-	// 2. Normalize (Crucial!)
-	// Assuming training data was MinMaxNormalized (0.0 to 1.0).
-	// If your JPG reader returns 0-255, you MUST divide by 255.0.
-	for i := range pixelData {
-		pixelData[i] = pixelData[i] / 255.0
-	}
-
-	// 3. Predict
-	prediction, confidence := masterNN.Predict(pixelData)
-
-	fmt.Printf("Image: %s\n", imagePath)
-	fmt.Printf("Predicted Digit: %d\n", prediction)
-	fmt.Printf("Confidence: %.2f%%\n", confidence*100)
+    for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+        for x := bounds.Min.X; x < bounds.Max.X; x++ {
+            r, g, b, _ := dst.At(x, y).RGBA()
+            // Standard Grayscale formula
+            gray := 0.299*float64(r>>8) + 0.587*float64(g>>8) + 0.114*float64(b>>8)
+            out = append(out, gray) // Returns 0-255 range
+        }
+    }
+    return out, nil
 }
