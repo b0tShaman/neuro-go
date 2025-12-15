@@ -479,9 +479,12 @@ func (nn *NeuralNetwork) ComputeGradients(input *Matrix, Y []float64, grads []Gr
 			zData := prevLayer.Z.data
 			dZPrevData := prevLayer.dZ.data
 			for k := range dZPrevData {
-				if zData[k] <= 0 {
-					dZPrevData[k] = 0
-				}
+				// Logic: error = error * derivative(input)
+				dZPrevData[k] *= ReluDerivative(zData[k])
+				// Uncomment to avoid loading ReluDerivative function
+				// if zData[k] <= 0 {
+				// 	dZPrevData[k] = 0
+				// }
 			}
 		}
 	}
@@ -722,7 +725,7 @@ func main() {
 	fmt.Printf("Running on %d cores (Mini-Batch Mode)\n", runtime.GOMAXPROCS(0))
 
 	// --- 1. Load Data ---
-	X_raw, Y_raw, err := data.LoadCSV("mnist_train.csv")
+	X_raw, Y_raw, err := data.LoadCSV("assets/mnist_train.csv")
 	if err != nil {
 		panic("Failed to load data: " + err.Error())
 	}
@@ -736,7 +739,7 @@ func main() {
 
 	// --- NEW INITIALIZATION SYNTAX ---
 	masterNN := NewNetwork(0.1,
-		Input(784),
+		Input(inputDim),
 		Dense(64),
 		Dense(32),
 		Dense(16),
@@ -744,7 +747,7 @@ func main() {
 	)
 
 	// --- 1. Auto-Load Logic ---
-	modelFile := "mnist_model.gob"
+	modelFile := "assets/model.gob"
 	if _, err := os.Stat(modelFile); err == nil {
 		fmt.Println("Found existing model. Loading weights...")
 		if err := masterNN.LoadFromFile(modelFile); err != nil {
