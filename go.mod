@@ -5,7 +5,6 @@ go 1.24
 toolchain go1.24.11
 
 require (
-	github.com/b0tShaman/go-rout-net v0.0.0-20251214113011-c0e9dfd6532f
 	golang.org/x/image v0.25.0
 	gonum.org/v1/gonum v0.16.0
 )
