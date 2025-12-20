@@ -29,6 +29,7 @@ const (
 	ActSigmoid
 	ActSoftmax
 	ActEmbedding
+	ActAttention
 )
 
 const (
@@ -65,16 +66,19 @@ type LayerConfig struct {
 	// Fields for Embeddings
 	VocabSize int
 	EmbedDim  int
+	// Attention fields
+	HeadCount int // Number of heads (Keeping it 1 for this implementation)
 }
 
 type LayerState struct {
-	// Moving averages for Weights
-	mW *Matrix
-	vW *Matrix
+	// Standard (Dense/Embedding/Projection)
+	mW, vW *Matrix
+	mB, vB *Matrix
 
-	// Moving averages for Biases
-	mB *Matrix
-	vB *Matrix
+	// Attention Specific
+	mWQ, vWQ *Matrix
+	mWK, vWK *Matrix
+	mWV, vWV *Matrix
 }
 
 type Layer struct {
@@ -88,6 +92,45 @@ type Layer struct {
 	// Backward State
 	dZ      *Matrix
 	ActType ActivationType
+
+	// Attention Specific Weights
+	WQ, WK, WV *Matrix
+
+	// Attention Gradients
+	dWQ, dWK, dWV *Matrix
+
+	// Attention Cache (for Backprop)
+	// We need to store Q, K, V per batch to calculate gradients
+	// Storing as slice of Matrices because they differ per sample
+	cacheQ, cacheK, cacheV []*Matrix
+
+	PosEnc *Matrix // Stores the pre-computed positional encoding
+
+	// Pre-allocated workspaces (Size = BatchSize)
+	Workspaces []*AttentionWorkspace
+}
+
+// AttentionWorkspace holds all pre-allocated matrices for a single sample's
+// Forward and Backward pass.
+// AttentionWorkspace holds pre-allocated buffers for a single sample
+type AttentionWorkspace struct {
+	// Forward Buffers
+	X, Q, K, V *Matrix
+	Scores     *Matrix
+	AttnOut    *Matrix
+
+	// Backward Buffers
+	dScores    *Matrix
+	dAttnOut   *Matrix
+	dQ, dK, dV *Matrix
+
+	// Temporary Buffers (Reusable scratchpads for accumulation)
+	tmpGrad *Matrix // Used for dWQ, dWK, dWV accumulation
+	tmpX    *Matrix // Used for dX accumulation
+
+	// NEW: Wrappers to avoid NewMatrixFromSlice inside loops
+	dZ_proj    *Matrix // For reading incoming gradients in Backprop
+	ProjectOut *Matrix // For writing outgoing results in Forward
 }
 
 type NeuralNetwork struct {
@@ -126,8 +169,10 @@ type SGDOptimizer struct {
 
 type MomentumOptimizer struct {
 	LearningRate float64
-	Mu           float64
-	velocities   [][]GradientSet // State: vW, vB per layer
+	Mu           float64 // Momentum Factor (usually 0.9)
+
+	// Changed from [][]GradientSet to support Attention (Q, K, V)
+	layerStates []*LayerState
 }
 
 type TrainingConfig struct {
@@ -136,6 +181,7 @@ type TrainingConfig struct {
 	LearningRate float64
 	ModelPath    string
 	NumWorkers   int
+	VerboseEvery int // How often to log progress (in epochs)
 
 	// Optimizer Selection
 	Optimizer OptimizerType
@@ -188,57 +234,102 @@ func NewNetwork(configs ...LayerConfig) *NeuralNetwork {
 	}
 
 	nn := &NeuralNetwork{}
-	prevOutputSize := configs[0].Neurons
+	prevOutputSize := configs[0].Neurons // Starts as ContextLen
 
 	for i := 1; i < len(configs); i++ {
 		cfg := configs[i]
 
 		var weightsRows, weightsCols int
+		var nextPrevOutputSize int // What we tell the NEXT layer our output is
 
-		// Special Handling for Embedding Layer
-		if cfg.Activation == ActEmbedding {
+		switch cfg.Activation {
+		case ActEmbedding:
 			if cfg.VocabSize == 0 {
-				panic("VocabSize must be set for Embedding layer")
+				panic("VocabSize missing for Embedding")
 			}
 
-			// 2. Mandatory Position Check
-			// Since i=0 is Input, i=1 is the very first hidden layer.
-			// This ensures: Input -> Embedding -> ...
-			if i != 1 {
-				panic("Embedding layer must be the second layer immediately after Input")
-			}
-
-			// Weights are (VocabSize x EmbedDim)
 			weightsRows = cfg.VocabSize
 			weightsCols = cfg.EmbedDim
 
-			// The output of this layer is flattened: ContextLen * EmbedDim
+			// Embedding expands Input(ContextLen) -> Output(ContextLen * EmbedDim)
 			if cfg.Neurons == 0 {
 				cfg.Neurons = prevOutputSize * cfg.EmbedDim
 			}
-		} else {
+			nextPrevOutputSize = cfg.Neurons
+
+		case ActAttention:
+			// [FIX] Attention Layer Dimensions
+			// Input: [Batch, ContextLen * EmbedDim]
+			// We need to extract EmbedDim from config
+			embedDim := cfg.Neurons // This was set via SelfAttention(64)
+
+			// Validation
+			if prevOutputSize%embedDim != 0 {
+				panic(fmt.Sprintf("Layer %d Input %d not divisible by EmbedDim %d", i, prevOutputSize, embedDim))
+			}
+
+			// Weights (W_O) are Square [EmbedDim, EmbedDim]
+			weightsRows = embedDim
+			weightsCols = embedDim
+
+			// [FIX] Output size preserves Input size (ContextLen * EmbedDim)
+			// We do NOT change prevOutputSize for the next layer
+			nextPrevOutputSize = prevOutputSize
+
+			// Force the layer's stored "Neurons" to match actual output for buffer init
+			cfg.Neurons = prevOutputSize
+
+		default:
 			// Standard Dense Layer
 			weightsRows = prevOutputSize
 			weightsCols = cfg.Neurons
+			nextPrevOutputSize = cfg.Neurons
 		}
 
 		layer := &Layer{
 			Weights: NewMatrix(weightsRows, weightsCols),
-			Biases:  NewMatrix(1, cfg.Neurons), // Biases usually unused in Embedding, but kept for structural consistency
+			Biases:  NewMatrix(1, cfg.Neurons), // Biases match flattened output
 			ActType: cfg.Activation,
 		}
 
-		// Initialize Weights
-		if cfg.Activation == ActEmbedding {
-			// Use Standard Random (or tailored Embedding init)
+		// Initialize Specific Weights
+		switch cfg.Activation {
+		case ActAttention:
+			embedDim := weightsRows
+			layer.WQ = NewMatrix(embedDim, embedDim)
+			layer.WQ.Randomize()
+			layer.WK = NewMatrix(embedDim, embedDim)
+			layer.WK.Randomize()
+			layer.WV = NewMatrix(embedDim, embedDim)
+			layer.WV.Randomize()
+
+			layer.dWQ = NewMatrix(embedDim, embedDim)
+			layer.dWK = NewMatrix(embedDim, embedDim)
+			layer.dWV = NewMatrix(embedDim, embedDim)
+
+			// Projection Weight (Weights) Init
 			layer.Weights.Randomize()
-		} else {
-			// Use Xavier/Glorot for Dense layers
-			layer.Weights.RandomizeXavier()
+
+		case ActEmbedding:
+			layer.ActType = cfg.Activation
+
+			// [ADD THIS BLOCK]
+			// Calculate ContextLen based on Neurons (Total Output) / EmbedDim
+			// Note: ensure cfg.Neurons is set correctly before this (it is set in your switch)
+			contextLen := cfg.Neurons / cfg.EmbedDim
+
+			peData := MakePositionalEncoding(contextLen, cfg.EmbedDim)
+			layer.PosEnc = NewMatrixFromSlice(1, cfg.Neurons, peData)
+			// Small init for embeddings
+			for k := range layer.Weights.data {
+				layer.Weights.data[k] = (rand.Float64()*2 - 1) * 0.01
+			}
+		default:
+			layer.Weights.Randomize()
 		}
 
 		nn.Layers = append(nn.Layers, layer)
-		prevOutputSize = cfg.Neurons
+		prevOutputSize = nextPrevOutputSize
 	}
 
 	return nn
@@ -314,13 +405,27 @@ func NewMomentumOptimizer(nw *NeuralNetwork, lr, mu float64) *MomentumOptimizer 
 	opt := &MomentumOptimizer{
 		LearningRate: lr,
 		Mu:           mu,
-		velocities:   make([][]GradientSet, len(nw.Layers)),
+		layerStates:  make([]*LayerState, len(nw.Layers)),
 	}
 
+	// Pre-allocate memory for velocities (held in LayerState matrices)
 	for i, layer := range nw.Layers {
-		opt.velocities[i] = make([]GradientSet, 1)
-		opt.velocities[i][0].dW = NewMatrix(layer.Weights.rows, layer.Weights.cols)
-		opt.velocities[i][0].db = NewMatrix(layer.Biases.rows, layer.Biases.cols)
+		state := &LayerState{}
+
+		// 1. Standard Velocities (Weights & Biases)
+		// Used by Dense, Embedding, and Attention (for Output Projection)
+		state.mW = NewMatrix(layer.Weights.rows, layer.Weights.cols)
+		state.mB = NewMatrix(layer.Biases.rows, layer.Biases.cols)
+
+		// 2. Attention Velocities (Q, K, V)
+		if layer.ActType == ActAttention {
+			r, c := layer.WQ.rows, layer.WQ.cols
+			state.mWQ = NewMatrix(r, c)
+			state.mWK = NewMatrix(r, c)
+			state.mWV = NewMatrix(r, c)
+		}
+
+		opt.layerStates[i] = state
 	}
 	return opt
 }
@@ -387,6 +492,20 @@ func OutputDim(size int) LayerOption {
 	}
 }
 
+// Helper Constructor
+func SelfAttention(embedDim int, opts ...LayerOption) LayerConfig {
+	cfg := LayerConfig{
+		Activation: ActAttention,
+		Neurons:    embedDim, // Output dim usually equals input dim in Transformers
+		IsInput:    false,
+		HeadCount:  1,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
+}
+
 // -------- MAIN -------- //
 func main() {
 	// Hardware Setup
@@ -401,6 +520,7 @@ func main() {
 	// if err != nil {
 	//  panic("Failed to load data: " + err.Error())
 	// }
+	// data.MinMaxNormalize(X_raw)
 
 	// Text Data
 	embedDim := 4
@@ -411,7 +531,7 @@ func main() {
 	var Y any
 	var err error
 
-	outputDim := contextLen * embedDim // Output dimension for Embedding layer for non-sequential model(n-gram)
+	// outputDim := contextLen * embedDim // Output dimension for Embedding layer for non-sequential model(n-gram)
 
 	vocabSize, wordToID, idToWord := data.PreprocessNGramData(
 		contextLen,
@@ -440,10 +560,10 @@ func main() {
 
 	// 2. Initialize Network
 	nw := NewNetwork(
-		Input(inputDim),
-		Embedding(embedDim, VocabSize(vocabSize), OutputDim(outputDim)),
-		Dense(128),
-		Dense(128),
+		Input(contextLen),
+		Embedding(embedDim, VocabSize(vocabSize)), // Output: Batch x (ContextLen * 64)
+		SelfAttention(embedDim),                   // Input: (ContextLen*64) -> Output: (ContextLen*64)
+		Dense(64),
 		Dense(vocabSize, Activation("softmax")),
 	)
 
@@ -460,93 +580,47 @@ func main() {
 
 	// 3. Configure & Train
 	config := TrainingConfig{
-		Epochs:       150,
+		Epochs:       1000,
 		BatchSize:    G * 16,
 		LearningRate: 0.001, // Adam default is 0.001, SGD can be higher
 		ModelPath:    modelFile,
 		NumWorkers:   G,
 		Optimizer:    OptAdam,
 		MomentumMu:   0.9, // Only used if OptMomentum is selected
+		VerboseEvery: 100,
 	}
 
 	fmt.Printf("Running on %d cores (Mini-Batch = %d)\n\n", runtime.GOMAXPROCS(0), config.BatchSize)
 
 	// Text Training and Inference
-	nw.TrainTxt(X_global, Y_raw, config)
-	nw.InferenceTxt(wordToID, idToWord)
+	Train(nw, X_global, Y_raw, config)
+	InferenceTxt(nw, wordToID, idToWord)
 
 	// Img Training and Inference
-	// nw.TrainImg(X_global, Y_raw, config)
-	// nw.InferenceImg("assets/5.jpg")
+	// Train(nw, X_global, Y_raw, config)
+	// InferenceImg(nw, "assets/5.jpg")
 }
 
-func (nw *NeuralNetwork) TrainTxt(X_ids *Matrix, Y_ids []float64, cfg TrainingConfig) {
+func Train(nw *NeuralNetwork, X_ids *Matrix, Y_ids []float64, cfg TrainingConfig) {
 	fmt.Printf("TrainingConfig: %+v\n", cfg)
+	validateConfig(cfg)
 
-	if cfg.BatchSize%cfg.NumWorkers != 0 {
-		panic("BatchSize must be divisible by NumWorkers")
-	}
-
+	// 1. Setup & Allocation
 	optimizer := NewOptimizer(nw, cfg)
 	localBatchSize := cfg.BatchSize / cfg.NumWorkers
-	inputCtxLen := X_ids.cols // This is contextLen
+	inputCtxLen := X_ids.cols
 	numSamples := X_ids.rows
 
-	// 1. PRE-ALLOCATE WORKER MEMORY
-	workers := make([]*NeuralNetwork, cfg.NumWorkers)
-	workerGrads := make([][]GradientSet, cfg.NumWorkers)
-
-	fmt.Printf("Initializing %d workers (Worker Batch: %d)\n", cfg.NumWorkers, localBatchSize)
-
-	for i := 0; i < cfg.NumWorkers; i++ {
-		workers[i] = nw.CloneStructure()
-		// Important: InitializeBuffers determines size based on Weights.
-		// For Embedding layer, InputBuf must match [Batch, ContextLen].
-		workers[i].InitializeBuffers(localBatchSize)
-
-		workerGrads[i] = make([]GradientSet, len(nw.Layers))
-		for l := 0; l < len(nw.Layers); l++ {
-			// [FIX] Source dimensions separately for Weights and Biases
-			wRows, wCols := nw.Layers[l].Weights.rows, nw.Layers[l].Weights.cols
-			bRows, bCols := nw.Layers[l].Biases.rows, nw.Layers[l].Biases.cols
-
-			workerGrads[i][l].dW = NewMatrix(wRows, wCols)
-			workerGrads[i][l].db = NewMatrix(bRows, bCols) // Use bCols, not wCols
-		}
-	}
-
-	// 2. MASTER GRADIENT BUFFER
-	finalGrads := make([]GradientSet, len(nw.Layers))
-	for l := 0; l < len(nw.Layers); l++ {
-		// [FIX] Source dimensions separately
-		wRows, wCols := nw.Layers[l].Weights.rows, nw.Layers[l].Weights.cols
-		bRows, bCols := nw.Layers[l].Biases.rows, nw.Layers[l].Biases.cols
-
-		finalGrads[l].dW = NewMatrix(wRows, wCols)
-		finalGrads[l].db = NewMatrix(bRows, bCols) // Use bCols, not wCols
-	}
-
+	// Delegate allocation logic to helpers
+	workers, workerGrads := initializeWorkers(nw, cfg.NumWorkers, localBatchSize)
+	finalGrads := initializeMasterGradients(nw)
+	workerLabels, workerLosses, workerAccs := initializeAuxBuffers(cfg.NumWorkers, localBatchSize)
 	globalIndices := NewIndexList(numSamples)
 
-	// Label buffers
-	workerLabels := make([][]float64, cfg.NumWorkers)
-	for i := 0; i < cfg.NumWorkers; i++ {
-		workerLabels[i] = make([]float64, localBatchSize)
-	}
+	// Delegate signal handling
+	setupSignalHandler(nw, cfg.ModelPath)
 
-	workerLosses := make([]float64, cfg.NumWorkers)
-	workerAccs := make([]float64, cfg.NumWorkers)
-
-	// Signal Handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		fmt.Println("\nInterrupt! Saving model...")
-		nw.SaveToFile(cfg.ModelPath)
-		os.Exit(0)
-	}()
-
+	// 2. Training Loop
 	start := time.Now()
 	fmt.Println("Starting Training...")
 
@@ -560,7 +634,7 @@ func (nw *NeuralNetwork) TrainTxt(X_ids *Matrix, Y_ids []float64, cfg TrainingCo
 			var wg sync.WaitGroup
 			wg.Add(cfg.NumWorkers)
 
-			// Dispatch Workers
+			// --- A. Data Parallelism: Dispatch Workers ---
 			for i := 0; i < cfg.NumWorkers; i++ {
 				go func(id int) {
 					defer wg.Done()
@@ -568,9 +642,10 @@ func (nw *NeuralNetwork) TrainTxt(X_ids *Matrix, Y_ids []float64, cfg TrainingCo
 					wEnd := wStart + localBatchSize
 					myIndices := globalIndices[wStart:wEnd]
 
-					// Gather works for Indices too (copies floats)
+					// Copy data to worker buffers
 					Gather(myIndices, X_ids.data, Y_ids, inputCtxLen, workers[id].InputBuf, workerLabels[id])
 
+					// Forward & Backward pass
 					workers[id].Forward(workers[id].InputBuf)
 					loss, acc := workers[id].ComputeGradients(workers[id].InputBuf, workerLabels[id], workerGrads[id])
 
@@ -580,38 +655,48 @@ func (nw *NeuralNetwork) TrainTxt(X_ids *Matrix, Y_ids []float64, cfg TrainingCo
 			}
 			wg.Wait()
 
-			// Aggregate Gradients
+			// --- B. Aggregation Logic ---
+			scale := 1.0 / float64(cfg.NumWorkers)
+
+			// 1. Aggregate Standard Weights & Biases
 			for l := range finalGrads {
 				finalDW := finalGrads[l].dW
 				finalDB := finalGrads[l].db
+
+				// Initialize with Worker 0
 				copy(finalDW.data, workerGrads[0][l].dW.data)
 				copy(finalDB.data, workerGrads[0][l].db.data)
 
+				// Sum remaining workers
 				for w := 1; w < cfg.NumWorkers; w++ {
 					floats.Add(finalDW.data, workerGrads[w][l].dW.data)
 					floats.Add(finalDB.data, workerGrads[w][l].db.data)
 				}
+
+				// Apply Scale
+				floats.Scale(scale, finalDW.data)
+				floats.Scale(scale, finalDB.data)
+
+				// 2. Aggregate Attention Specifics (WQ, WK, WV) if applicable
+				if nw.Layers[l].ActType == ActAttention {
+					aggregateAttentionGradients(nw.Layers[l], workers, l, cfg.NumWorkers, scale)
+				}
 			}
 
-			// Apply Scale & Update
-			scale := 1.0 / float64(cfg.NumWorkers)
-			for l := range finalGrads {
-				floats.Scale(scale, finalGrads[l].dW.data)
-				floats.Scale(scale, finalGrads[l].db.data)
-			}
-
+			// --- C. Optimization & Tracking ---
 			optimizer.Update(nw, finalGrads)
 
 			for i := range cfg.NumWorkers {
-				totalLoss += workerLosses[i] / float64(cfg.NumWorkers)
-				totalAcc += workerAccs[i] / float64(cfg.NumWorkers)
+				totalLoss += workerLosses[i] * scale // equivalent to / NumWorkers
+				totalAcc += workerAccs[i] * scale
 			}
 			batchesProcessed++
 		}
 
+		// Logging
 		avgLoss := totalLoss / float64(batchesProcessed)
 		avgAcc := (totalAcc / float64(batchesProcessed)) * 100
-		if epoch%10 == 0 || epoch == 1 {
+		if epoch%cfg.VerboseEvery == 0 || epoch == 1 {
 			fmt.Printf("Epoch %d | Loss: %.4f | Acc: %.2f%% | Time: %v\n", epoch, avgLoss, avgAcc, time.Since(start))
 		}
 	}
@@ -620,7 +705,7 @@ func (nw *NeuralNetwork) TrainTxt(X_ids *Matrix, Y_ids []float64, cfg TrainingCo
 	fmt.Printf("Training Complete. Total Time: %v\n\n", time.Since(start))
 }
 
-func (nw *NeuralNetwork) InferenceTxt(wordToID map[string]int, idToWord []string) {
+func InferenceTxt(nw *NeuralNetwork, wordToID map[string]int, idToWord []string) {
 	// 1. Setup & Context Calculation
 	reader := bufio.NewReader(os.Stdin)
 
@@ -642,7 +727,14 @@ func (nw *NeuralNetwork) InferenceTxt(wordToID map[string]int, idToWord []string
 	// Constants for Tokenization
 	const PAD = "<pad>"
 	const UNK = "<unk>"
-	const EOS = "eos" // Stop generation at this token
+	const EOS = "." // Stop generation at this token
+
+	var endTokensInf = map[string]bool{
+		".":   false,
+		"?":   false,
+		"!":   false,
+		"eos": false,
+	}
 
 	// 2. Interactive Loop
 	for {
@@ -715,11 +807,16 @@ func (nw *NeuralNetwork) InferenceTxt(wordToID map[string]int, idToWord []string
 			} // Safety check
 
 			word := idToWord[bestID]
-			fmt.Print(word + " ")
+			if word == "<crlf>" {
+				fmt.Print("\n")
+			} else {
+				fmt.Print(word + " ")
+			}
+
 			time.Sleep(100 * time.Millisecond)
 
 			// F. Stop Conditions
-			if word == EOS || word == "." {
+			if word == EOS {
 				break
 			}
 
@@ -727,164 +824,38 @@ func (nw *NeuralNetwork) InferenceTxt(wordToID map[string]int, idToWord []string
 			// [A, B, C] -> [B, C, NewID]
 			copy(window[0:], window[1:])
 			window[contextLen-1] = float64(bestID)
+
+			// 2. FULL STOP logic
+			if endTokensInf[word] {
+				fmt.Print("\n\nEnter text: ")
+
+				newLine, _ := reader.ReadString('\n')
+				newLine = strings.TrimSpace(strings.ToLower(newLine))
+
+				if newLine == "" {
+					break
+				}
+
+				newWords := strings.Fields(newLine)
+
+				// Append new text into window sliding
+				for _, w := range newWords {
+					id, ok := wordToID[w]
+					if !ok {
+						id = wordToID[UNK]
+					}
+					window = append(window[1:], float64(id))
+				}
+
+				// Continue generating based on updated window
+				continue
+			}
 		}
 		fmt.Println() // Newline after response
 	}
 }
 
-// -------- NEURAL NETWORK METHODS -------- //
-func (nw *NeuralNetwork) TrainImg(X_global *Matrix, Y_raw []float64, cfg TrainingConfig) {
-	fmt.Printf("TrainingConfig: %+v\n", cfg)
-
-	if cfg.BatchSize%cfg.NumWorkers != 0 {
-		panic("BatchSize must be divisible by NumWorkers")
-	}
-
-	for i := range X_global.data {
-		X_global.data[i] /= 255.0
-	}
-
-	// Create the chosen optimizer
-	optimizer := NewOptimizer(nw, cfg)
-
-	localBatchSize := cfg.BatchSize / cfg.NumWorkers
-	inputDim := X_global.cols
-	numSamples := X_global.rows
-
-	// 1. PRE-ALLOCATE WORKER MEMORY
-	workers := make([]*NeuralNetwork, cfg.NumWorkers)
-	workerGrads := make([][]GradientSet, cfg.NumWorkers)
-
-	fmt.Printf("Initializing %d workers (Worker Batch: %d)\n", cfg.NumWorkers, localBatchSize)
-
-	for i := 0; i < cfg.NumWorkers; i++ {
-		workers[i] = nw.CloneStructure()
-		workers[i].InitializeBuffers(localBatchSize)
-
-		workerGrads[i] = make([]GradientSet, len(nw.Layers))
-		for l := 0; l < len(nw.Layers); l++ {
-			rows, cols := nw.Layers[l].Weights.rows, nw.Layers[l].Weights.cols
-			workerGrads[i][l].dW = NewMatrix(rows, cols)
-			workerGrads[i][l].db = NewMatrix(1, cols)
-		}
-	}
-
-	// 2. MASTER GRADIENT BUFFER
-	finalGrads := make([]GradientSet, len(nw.Layers))
-	for l := 0; l < len(nw.Layers); l++ {
-		rows, cols := nw.Layers[l].Weights.rows, nw.Layers[l].Weights.cols
-		finalGrads[l].dW = NewMatrix(rows, cols)
-		finalGrads[l].db = NewMatrix(1, cols)
-	}
-
-	// 3. AUXILIARY BUFFERS
-	globalIndices := NewIndexList(numSamples)
-
-	// Label buffers (avoid alloc inside loop)
-	workerLabels := make([][]float64, cfg.NumWorkers)
-	for i := 0; i < cfg.NumWorkers; i++ {
-		workerLabels[i] = make([]float64, localBatchSize)
-	}
-
-	// Stats buffers
-	workerLosses := make([]float64, cfg.NumWorkers)
-	workerAccs := make([]float64, cfg.NumWorkers)
-
-	// 4. SIGNAL HANDLING (Ctrl+C)
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		fmt.Println("\n\nInterrupt received! Saving model...")
-		nw.SaveToFile(cfg.ModelPath)
-		os.Exit(0)
-	}()
-
-	// 5. TRAINING LOOP
-	start := time.Now()
-	fmt.Println("Starting Training...")
-
-	for epoch := 1; epoch <= cfg.Epochs; epoch++ {
-		ShuffleIndices(globalIndices)
-
-		var totalLoss, totalAcc float64
-		batchesProcessed := 0
-
-		for batchStart := 0; batchStart+cfg.BatchSize <= numSamples; batchStart += cfg.BatchSize {
-			var wg sync.WaitGroup
-			wg.Add(cfg.NumWorkers)
-
-			// A. Dispatch Workers
-			for i := 0; i < cfg.NumWorkers; i++ {
-				go func(id int) {
-					defer wg.Done()
-
-					// Calc indices
-					wStart := batchStart + (id * localBatchSize)
-					wEnd := wStart + localBatchSize
-					myIndices := globalIndices[wStart:wEnd]
-
-					// Gather Data
-					Gather(myIndices, X_global.data, Y_raw, inputDim, workers[id].InputBuf, workerLabels[id])
-
-					// Compute
-					workers[id].Forward(workers[id].InputBuf)
-					loss, acc := workers[id].ComputeGradients(workers[id].InputBuf, workerLabels[id], workerGrads[id])
-
-					workerLosses[id] = loss
-					workerAccs[id] = acc
-				}(i)
-			}
-			wg.Wait()
-
-			// B. Aggregate Gradients (Optimized Copy+Add)
-			for l := range finalGrads {
-				finalDW := finalGrads[l].dW
-				finalDB := finalGrads[l].db
-
-				// 1. Copy Worker 0 (Fastest init)
-				copy(finalDW.data, workerGrads[0][l].dW.data)
-				copy(finalDB.data, workerGrads[0][l].db.data)
-
-				// 2. Add remaining workers
-				for w := 1; w < cfg.NumWorkers; w++ {
-					floats.Add(finalDW.data, workerGrads[w][l].dW.data)
-					floats.Add(finalDB.data, workerGrads[w][l].db.data)
-				}
-			}
-
-			// C. Update Weights
-			// scale := 1.0 / float64(cfg.NumWorkers)
-			// nw.UpdateWeights(finalGrads, scale)
-			scale := 1.0 / float64(cfg.NumWorkers)
-
-			for l := range finalGrads {
-				// Apply scaling directly to the gradient matrices before passing to Adam
-				floats.Scale(scale, finalGrads[l].dW.data)
-				floats.Scale(scale, finalGrads[l].db.data)
-			}
-
-			optimizer.Update(nw, finalGrads)
-
-			// D. Aggregate Stats
-			for i := range cfg.NumWorkers {
-				totalLoss += workerLosses[i] / float64(cfg.NumWorkers)
-				totalAcc += workerAccs[i] / float64(cfg.NumWorkers)
-			}
-			batchesProcessed++
-		}
-
-		avgLoss := totalLoss / float64(batchesProcessed)
-		avgAcc := (totalAcc / float64(batchesProcessed)) * 100
-		fmt.Printf("Epoch %d | Loss: %.4f | Acc: %.2f%% | Time: %v\n", epoch, avgLoss, avgAcc, time.Since(start))
-	}
-
-	// Save final model
-	nw.SaveToFile(cfg.ModelPath)
-	fmt.Printf("Training Complete. Total Time: %v\n\n", time.Since(start))
-}
-
-func (nw *NeuralNetwork) InferenceImg(imagePath string) {
+func InferenceImg(nw *NeuralNetwork, imagePath string) {
 	fmt.Printf("Running Inference on: %s\n", imagePath)
 
 	// 1. Load & Convert
@@ -906,46 +877,111 @@ func (nw *NeuralNetwork) InferenceImg(imagePath string) {
 	fmt.Printf("Confidence: %.2f%%\n", confidence*100)
 }
 
-func (m *Matrix) GobEncode() ([]byte, error) {
-	w := new(bytes.Buffer)
-	encoder := gob.NewEncoder(w)
-	if err := encoder.Encode(m.rows); err != nil {
-		return nil, err
+func validateConfig(cfg TrainingConfig) {
+	if cfg.BatchSize%cfg.NumWorkers != 0 {
+		panic("BatchSize must be divisible by NumWorkers")
 	}
-	if err := encoder.Encode(m.cols); err != nil {
-		return nil, err
-	}
-	if err := encoder.Encode(m.data); err != nil {
-		return nil, err
-	}
-	return w.Bytes(), nil
 }
 
-func (m *Matrix) GobDecode(buf []byte) error {
-	r := bytes.NewBuffer(buf)
-	decoder := gob.NewDecoder(r)
-	if err := decoder.Decode(&m.rows); err != nil {
-		return err
-	}
-	if err := decoder.Decode(&m.cols); err != nil {
-		return err
-	}
-	if err := decoder.Decode(&m.data); err != nil {
-		return err
-	}
+// initializeWorkers creates clones of the network and allocates gradient memory for each worker
+func initializeWorkers(nw *NeuralNetwork, numWorkers, localBatchSize int) ([]*NeuralNetwork, [][]GradientSet) {
+	fmt.Printf("Initializing %d workers (Worker Batch: %d)\n", numWorkers, localBatchSize)
 
-	// Re-create the wrapper after loading data
-	m.dense = mat.NewDense(m.rows, m.cols, m.data)
+	workers := make([]*NeuralNetwork, numWorkers)
+	workerGrads := make([][]GradientSet, numWorkers)
 
-	return nil
+	for i := 0; i < numWorkers; i++ {
+		workers[i] = nw.CloneStructure()
+		workers[i].InitializeBuffers(localBatchSize)
+
+		workerGrads[i] = make([]GradientSet, len(nw.Layers))
+		for l := 0; l < len(nw.Layers); l++ {
+			// Standard Gradients
+			wRows, wCols := nw.Layers[l].Weights.rows, nw.Layers[l].Weights.cols
+			bRows, bCols := nw.Layers[l].Biases.rows, nw.Layers[l].Biases.cols
+
+			workerGrads[i][l].dW = NewMatrix(wRows, wCols)
+			workerGrads[i][l].db = NewMatrix(bRows, bCols)
+
+			// Special Attention Gradients (stored in Layer struct, not GradientSet)
+			if nw.Layers[l].ActType == ActAttention {
+				attnDim := wRows
+				workers[i].Layers[l].dWQ = NewMatrix(attnDim, attnDim)
+				workers[i].Layers[l].dWK = NewMatrix(attnDim, attnDim)
+				workers[i].Layers[l].dWV = NewMatrix(attnDim, attnDim)
+			}
+		}
+	}
+	return workers, workerGrads
 }
 
+// initializeMasterGradients allocates the buffer for aggregated gradients
+func initializeMasterGradients(nw *NeuralNetwork) []GradientSet {
+	finalGrads := make([]GradientSet, len(nw.Layers))
+	for l := 0; l < len(nw.Layers); l++ {
+		wRows, wCols := nw.Layers[l].Weights.rows, nw.Layers[l].Weights.cols
+		bRows, bCols := nw.Layers[l].Biases.rows, nw.Layers[l].Biases.cols
+		finalGrads[l].dW = NewMatrix(wRows, wCols)
+		finalGrads[l].db = NewMatrix(bRows, bCols)
+	}
+	return finalGrads
+}
+
+// initializeAuxBuffers creates buffers for labels, losses, and accuracy
+func initializeAuxBuffers(numWorkers, localBatchSize int) ([][]float64, []float64, []float64) {
+	workerLabels := make([][]float64, numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		workerLabels[i] = make([]float64, localBatchSize)
+	}
+	workerLosses := make([]float64, numWorkers)
+	workerAccs := make([]float64, numWorkers)
+	return workerLabels, workerLosses, workerAccs
+}
+
+// setupSignalHandler captures SIGINT/SIGTERM to save the model safely
+func setupSignalHandler(nw *NeuralNetwork, modelPath string) {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\nInterrupt! Saving model...")
+		nw.SaveToFile(modelPath)
+		os.Exit(0)
+	}()
+}
+
+// aggregateAttentionGradients handles the specific summation logic for Transformer layers
+func aggregateAttentionGradients(masterLayer *Layer, workers []*NeuralNetwork, layerIdx int, numWorkers int, scale float64) {
+	// 1. Reset Master Gradients
+	masterLayer.dWQ.Reset()
+	masterLayer.dWK.Reset()
+	masterLayer.dWV.Reset()
+
+	// 2. Sum up gradients from all workers
+	for w := 0; w < numWorkers; w++ {
+		workerLayer := workers[w].Layers[layerIdx]
+		floats.Add(masterLayer.dWQ.data, workerLayer.dWQ.data)
+		floats.Add(masterLayer.dWK.data, workerLayer.dWK.data)
+		floats.Add(masterLayer.dWV.data, workerLayer.dWV.data)
+	}
+
+	// 3. Apply Scaling
+	scaleFunc := func(v float64) float64 { return v * scale }
+	masterLayer.dWQ.ApplyFunc(scaleFunc)
+	masterLayer.dWK.ApplyFunc(scaleFunc)
+	masterLayer.dWV.ApplyFunc(scaleFunc)
+}
+
+// -------- NEURAL NETWORK METHODS -------- //
 func (nw *NeuralNetwork) InitializeBuffers(batchSize int) {
+	// 1. Determine Input Dimensions for Layer 0
 	inputDim := nw.Layers[0].Weights.rows
 	if nw.Layers[0].ActType == ActEmbedding {
+		// For Embedding, inputDim is calculated via biases or config
 		inputDim = nw.Layers[0].Biases.cols / nw.Layers[0].Weights.cols
 	}
 
+	// 2. Global Input Buffers
 	data := make([]float64, batchSize*inputDim)
 	nw.InputBuf = &Matrix{
 		rows:  batchSize,
@@ -955,17 +991,61 @@ func (nw *NeuralNetwork) InitializeBuffers(batchSize int) {
 	}
 	nw.InputT = NewMatrix(inputDim, batchSize)
 
+	// 3. Loop Layers
 	for _, layer := range nw.Layers {
 		var outputDim int
-		if layer.ActType == ActEmbedding {
+
+		// A. Determine Output Size
+		if layer.ActType == ActEmbedding || layer.ActType == ActAttention {
 			outputDim = layer.Biases.cols
 		} else {
 			outputDim = layer.Weights.cols
 		}
 
+		// B. Standard Layer Buffers
 		layer.Z = NewMatrix(batchSize, outputDim)
 		layer.A = NewMatrix(batchSize, outputDim)
 		layer.dZ = NewMatrix(batchSize, outputDim)
+
+		// C. Attention Specific Workspaces (ZERO ALLOC SETUP)
+		if layer.ActType == ActAttention {
+			embedDim := layer.Weights.rows
+			totalCols := layer.Biases.cols // This is (ContextLen * EmbedDim)
+			contextLen := totalCols / embedDim
+
+			// Create a workspace for every sample in the batch
+			layer.Workspaces = make([]*AttentionWorkspace, batchSize)
+
+			for b := 0; b < batchSize; b++ {
+				ws := &AttentionWorkspace{}
+
+				// 1. Forward Matrices
+				ws.X = NewMatrix(contextLen, embedDim)
+				ws.Q = NewMatrix(contextLen, embedDim)
+				ws.K = NewMatrix(contextLen, embedDim)
+				ws.V = NewMatrix(contextLen, embedDim)
+				ws.Scores = NewMatrix(contextLen, contextLen)
+				ws.AttnOut = NewMatrix(contextLen, embedDim)
+
+				// 2. Backward Matrices
+				ws.dScores = NewMatrix(contextLen, contextLen)
+				ws.dAttnOut = NewMatrix(contextLen, embedDim)
+				ws.dQ = NewMatrix(contextLen, embedDim)
+				ws.dK = NewMatrix(contextLen, embedDim)
+				ws.dV = NewMatrix(contextLen, embedDim)
+
+				// 3. Scratchpads
+				// Size matches the largest matrix we need to accumulate (EmbedDim x EmbedDim)
+				ws.tmpGrad = NewMatrix(embedDim, embedDim)
+				ws.tmpX = NewMatrix(contextLen, embedDim)
+
+				// They are size [ContextLen, EmbedDim]
+				ws.dZ_proj = NewMatrix(contextLen, embedDim)
+				ws.ProjectOut = NewMatrix(contextLen, embedDim)
+
+				layer.Workspaces[b] = ws
+			}
+		}
 	}
 }
 
@@ -979,6 +1059,10 @@ func (nw *NeuralNetwork) CloneStructure() *NeuralNetwork {
 			Weights: l.Weights,
 			Biases:  l.Biases,
 			ActType: l.ActType, // Copy activation type
+			WQ:      l.WQ,
+			WK:      l.WK,
+			WV:      l.WV,
+			PosEnc:  l.PosEnc,
 		}
 	}
 	return newNN
@@ -987,8 +1071,68 @@ func (nw *NeuralNetwork) CloneStructure() *NeuralNetwork {
 func (nw *NeuralNetwork) Forward(input *Matrix) {
 	activation := input
 	for _, layer := range nw.Layers {
+		switch layer.ActType {
+		case ActAttention:
+			// --- ATTENTION FORWARD (Sequential & Zero Alloc) ---
+			batchSize := activation.rows
+			totalInputCols := activation.cols
+			embedDim := layer.Weights.rows
+			contextLen := totalInputCols / embedDim
+			scale := 1.0 / math.Sqrt(float64(embedDim))
 
-		if layer.ActType == ActEmbedding {
+			// Loop sequentially (No go routines) to avoid oversubscription
+			for b := 0; b < batchSize; b++ {
+
+				// 1. Get Workspace
+				ws := layer.Workspaces[b]
+
+				// 2. Load Input (Copy slice to Workspace X)
+				rowStart := b * totalInputCols
+				copy(ws.X.data, activation.data[rowStart:rowStart+totalInputCols])
+
+				// 3. Compute Q, K, V
+				// MatMul stores result directly in ws.Q, ws.K, ws.V
+				MatMul(ws.X.dense, layer.WQ.dense, ws.Q)
+				MatMul(ws.X.dense, layer.WK.dense, ws.K)
+				MatMul(ws.X.dense, layer.WV.dense, ws.V)
+
+				// 4. Compute Scores = Q * K^T
+				MatMul(ws.Q.dense, ws.K.dense.T(), ws.Scores)
+
+				// 5. Causal Masking & Scaling (Direct Data Access)
+				sData := ws.Scores.data
+				for r := 0; r < contextLen; r++ {
+					rowOffset := r * contextLen
+					for c := 0; c < contextLen; c++ {
+						if c > r {
+							sData[rowOffset+c] = -1e9 // Mask Future
+						} else {
+							sData[rowOffset+c] *= scale
+						}
+					}
+				}
+
+				// 6. Softmax (In-place on ws.Scores)
+				SoftmaxRow(ws.Scores)
+
+				// 7. Attention Output = Scores * V
+				MatMul(ws.Scores.dense, ws.V.dense, ws.AttnOut)
+
+				// 8. Output Projection (AttnOut * W_O) -> Global A
+				// We create a view of the destination row in layer.A
+				// STEP A: Compute into pre-allocated Workspace buffer (Zero Alloc)
+				MatMul(ws.AttnOut.dense, layer.Weights.dense, ws.ProjectOut)
+
+				// STEP B: Copy raw floats to Global A (Zero Alloc, very fast)
+				destStart := b * totalInputCols
+				// We copy from ws.ProjectOut.data to layer.A.data
+				copy(layer.A.data[destStart:destStart+totalInputCols], ws.ProjectOut.data)
+			}
+
+			// Pass forward
+			activation = layer.A
+
+		case ActEmbedding:
 			// --- EMBEDDING FORWARD (Lookup & Flatten) ---
 			// Input: [BatchSize, ContextLen] (Indices stored as floats)
 			// Weights: [VocabSize, EmbedDim]
@@ -1032,10 +1176,26 @@ func (nw *NeuralNetwork) Forward(input *Matrix) {
 					copy(outData[dstStart:dstStart+embedDim], wData[srcStart:srcStart+embedDim])
 				}
 			}
+			// Add Positional Encoding to every sample in the batch
+			peData := layer.PosEnc.data
+			outData = layer.A.data
+
+			// Since outData is [BatchSize, ContextLen * EmbedDim]
+			// and peData is [1, ContextLen * EmbedDim]
+			// We broadcast peData across every row of outData
+
+			rowSize := layer.PosEnc.cols // ContextLen * EmbedDim
+
+			for b := 0; b < batchSize; b++ {
+				offset := b * rowSize
+				for i := 0; i < rowSize; i++ {
+					outData[offset+i] += peData[i]
+				}
+			}
 			// Embedding has no bias or activation function, strictly lookup
 			activation = layer.A
 
-		} else {
+		default:
 			// --- STANDARD DENSE FORWARD ---
 			MatMul(activation.dense, layer.Weights.dense, layer.Z)
 			layer.Z.AddVector(layer.Biases)
@@ -1095,7 +1255,139 @@ func (nw *NeuralNetwork) ComputeGradients(input *Matrix, Y []float64, grads []Gr
 			A_prev_matrix = nw.Layers[i-1].A
 		}
 
-		if layer.ActType == ActEmbedding {
+		if layer.ActType == ActAttention {
+			// --- ATTENTION BACKWARD (Sequential & Zero Alloc) ---
+
+			// 1. Reset Gradients for this batch
+			layer.dWQ.Reset()
+			layer.dWK.Reset()
+			layer.dWV.Reset()
+			grads[i].dW.Reset() // dWO (Projection Weight)
+
+			embedDim := layer.Weights.rows
+			totalCols := layer.dZ.cols
+			contextLen := totalCols / embedDim
+			scale := 1.0 / math.Sqrt(float64(embedDim))
+
+			// Determine if we need to calc dZ_prev for previous layer
+			calcPrev := i > 0
+			var dX_prev_data []float64
+			if calcPrev {
+				nw.Layers[i-1].dZ.Reset()
+				dX_prev_data = nw.Layers[i-1].dZ.data
+			}
+
+			// Loop Sequentially
+			for b := 0; b < int(batchSize); b++ {
+				ws := layer.Workspaces[b]
+
+				// Incoming Gradient (dZ) from next layer
+				// We wrap the slice from global dZ buffer
+				dZStart := b * totalCols
+
+				// BAD (Allocates):
+				// dZ_proj := NewMatrixFromSlice(contextLen, embedDim, layer.dZ.data[dZStart : dZStart+totalCols])
+
+				// GOOD (Zero Alloc):
+				// Copy the relevant slice from global dZ into our workspace
+				copy(ws.dZ_proj.data, layer.dZ.data[dZStart:dZStart+totalCols])
+
+				// --- A. Backprop Output Projection (W_O) ---
+
+				// 1. dAttnOut = dZ_proj * W_O^T
+				MatMul(ws.dZ_proj.dense, layer.Weights.dense.T(), ws.dAttnOut)
+
+				// 2. dWO += AttnOut^T * dZ_proj
+				// We calculate into tmpGrad, then add to global accumulator
+				MatMul(ws.AttnOut.dense.T(), ws.dZ_proj.dense, ws.tmpGrad)
+				floats.Add(grads[i].dW.data, ws.tmpGrad.data)
+
+				// --- B. Backprop V ---
+
+				// 1. dV = Scores^T * dAttnOut
+				MatMul(ws.Scores.dense.T(), ws.dAttnOut.dense, ws.dV)
+
+				// 2. dWV += X^T * dV
+				MatMul(ws.X.dense.T(), ws.dV.dense, ws.tmpGrad)
+				floats.Add(layer.dWV.data, ws.tmpGrad.data)
+
+				// --- C. Backprop Scores (Softmax Derivative) ---
+
+				// 1. dScoresRaw = dAttnOut * V^T
+				MatMul(ws.dAttnOut.dense, ws.V.dense.T(), ws.dScores)
+
+				// 2. Apply Softmax Derivative In-Place
+				// dS_i = S_i * (dScoresRaw_i - dot(S, dScoresRaw))
+				scoresData := ws.Scores.data
+				dScoresData := ws.dScores.data
+
+				for r := 0; r < contextLen; r++ {
+					start := r * contextLen
+					end := start + contextLen
+
+					// Calculate Dot Product for this row
+					dot := 0.0
+					for k := start; k < end; k++ {
+						dot += scoresData[k] * dScoresData[k]
+					}
+
+					// Update dScores
+					for k := start; k < end; k++ {
+						val := scoresData[k] * (dScoresData[k] - dot)
+						dScoresData[k] = val * scale // Apply Scale Factor Here
+					}
+				}
+
+				// --- D. Backprop Q & K ---
+
+				// 1. dQ = dScores * K
+				MatMul(ws.dScores.dense, ws.K.dense, ws.dQ)
+
+				// 2. dK = dScores^T * Q
+				MatMul(ws.dScores.dense.T(), ws.Q.dense, ws.dK)
+
+				// 3. dWQ += X^T * dQ
+				MatMul(ws.X.dense.T(), ws.dQ.dense, ws.tmpGrad)
+				floats.Add(layer.dWQ.data, ws.tmpGrad.data)
+
+				// 4. dWK += X^T * dK
+				MatMul(ws.X.dense.T(), ws.dK.dense, ws.tmpGrad)
+				floats.Add(layer.dWK.data, ws.tmpGrad.data)
+
+				// --- E. Backprop Input X (Accumulate into prev layer dZ) ---
+				if calcPrev {
+					// dX = dQ*WQ^T + dK*WK^T + dV*WV^T
+
+					// Term 1 (Q) -> Accumulate into ws.tmpX
+					MatMul(ws.dQ.dense, layer.WQ.dense.T(), ws.tmpX)
+
+					// Term 2 (K) -> Store in tmpGrad for a moment (repurposing)
+					// Note: tmpGrad is [EmbedDim, EmbedDim], but we need [ContextLen, EmbedDim]
+					// We must assume ws.tmpGrad is NOT large enough for this if ContextLen > EmbedDim.
+					// SAFE FIX: Use ws.Q and ws.K as temporary buffers now, since we are done with their forward values!
+
+					// Term 2 -> ws.Q (reused as temp)
+					MatMul(ws.dK.dense, layer.WK.dense.T(), ws.Q)
+					floats.Add(ws.tmpX.data, ws.Q.data)
+
+					// Term 3 (V) -> ws.K (reused as temp)
+					MatMul(ws.dV.dense, layer.WV.dense.T(), ws.K)
+					floats.Add(ws.tmpX.data, ws.K.data)
+
+					// Write to Global dZ_prev
+					destSlice := dX_prev_data[b*totalCols : (b+1)*totalCols]
+					floats.Add(destSlice, ws.tmpX.data)
+				}
+			}
+
+			// Average Gradients by batch size
+			batchScale := 1.0 / float64(batchSize)
+			layer.dWQ.ApplyFunc(func(v float64) float64 { return v * batchScale })
+			layer.dWK.ApplyFunc(func(v float64) float64 { return v * batchScale })
+			layer.dWV.ApplyFunc(func(v float64) float64 { return v * batchScale })
+			// grads[i].dW (dWO) is scaled later in the common code
+
+		} else if layer.ActType == ActEmbedding {
 			// --- EMBEDDING BACKWARD ---
 			// We need to map dZ back to dW rows based on Input indices
 			// layer.dZ shape: [Batch, ContextLen * EmbedDim]
@@ -1205,11 +1497,19 @@ func (nw *NeuralNetwork) SaveToFile(filename string) error {
 	defer file.Close()
 	encoder := gob.NewEncoder(file)
 
+	// Updated Struct to hold Attention & Embedding extras
 	type LayerData struct {
 		Weights *Matrix
 		Biases  *Matrix
 		ActType ActivationType
+
+		// Attention Specific
+		WQ, WK, WV *Matrix
+
+		// Embedding Specific (Positional Encoding)
+		PosEnc *Matrix
 	}
+
 	type NetworkData struct {
 		LayerDatas   []LayerData
 		LearningRate float64
@@ -1217,9 +1517,28 @@ func (nw *NeuralNetwork) SaveToFile(filename string) error {
 
 	ld := make([]LayerData, len(nw.Layers))
 	for i, l := range nw.Layers {
-		ld[i] = LayerData{Weights: l.Weights, Biases: l.Biases, ActType: l.ActType}
+		data := LayerData{
+			Weights: l.Weights,
+			Biases:  l.Biases,
+			ActType: l.ActType,
+		}
+
+		// Save Attention Weights only if they exist
+		if l.ActType == ActAttention {
+			data.WQ = l.WQ
+			data.WK = l.WK
+			data.WV = l.WV
+		}
+
+		// Save Positional Encoding if it exists (Embedding Layer)
+		if l.ActType == ActEmbedding {
+			data.PosEnc = l.PosEnc
+		}
+
+		ld[i] = data
 	}
 
+	fmt.Println("Saving model to", filename)
 	return encoder.Encode(NetworkData{LayerDatas: ld, LearningRate: nw.LearningRate})
 }
 
@@ -1231,11 +1550,13 @@ func (nw *NeuralNetwork) LoadFromFile(filename string) error {
 	defer file.Close()
 	decoder := gob.NewDecoder(file)
 
-	// Temporary struct to hold the loaded data
+	// Same struct definition as SaveToFile
 	type LayerData struct {
-		Weights *Matrix
-		Biases  *Matrix
-		ActType ActivationType
+		Weights    *Matrix
+		Biases     *Matrix
+		ActType    ActivationType
+		WQ, WK, WV *Matrix
+		PosEnc     *Matrix
 	}
 	type NetworkData struct {
 		LayerDatas   []LayerData
@@ -1249,56 +1570,91 @@ func (nw *NeuralNetwork) LoadFromFile(filename string) error {
 
 	// --- VALIDATION STEP ---
 
-	// 1. Check Layer Count
 	if len(nw.Layers) != len(loadedData.LayerDatas) {
 		return fmt.Errorf("architecture mismatch: current network has %d layers, model file has %d",
 			len(nw.Layers), len(loadedData.LayerDatas))
 	}
 
-	// 2. Check Dimensions & Types for each layer
+	// Helper to check matrix dimensions
+	checkDims := func(name string, layerIdx int, current, loaded *Matrix) error {
+		if current == nil && loaded == nil {
+			return nil
+		}
+		if current == nil || loaded == nil {
+			return fmt.Errorf("layer %d %s mismatch: one is nil", layerIdx, name)
+		}
+		if current.rows != loaded.rows || current.cols != loaded.cols {
+			return fmt.Errorf("layer %d %s shape mismatch: expected [%d, %d], got [%d, %d]",
+				layerIdx, name,
+				current.rows, current.cols,
+				loaded.rows, loaded.cols,
+			)
+		}
+		return nil
+	}
+
 	for i, currLayer := range nw.Layers {
 		loadedLayer := loadedData.LayerDatas[i]
 
-		// Check Activation Type
+		// 1. Basic Checks
 		if currLayer.ActType != loadedLayer.ActType {
 			return fmt.Errorf("layer %d mismatch: expected activation %v, got %v",
 				i, currLayer.ActType, loadedLayer.ActType)
 		}
-
-		// Check Weight Dimensions
-		if currLayer.Weights.rows != loadedLayer.Weights.rows ||
-			currLayer.Weights.cols != loadedLayer.Weights.cols {
-			return fmt.Errorf("layer %d weight shape mismatch: expected [%d, %d], got [%d, %d]",
-				i,
-				currLayer.Weights.rows, currLayer.Weights.cols,
-				loadedLayer.Weights.rows, loadedLayer.Weights.cols,
-			)
+		if err := checkDims("Weights", i, currLayer.Weights, loadedLayer.Weights); err != nil {
+			return err
+		}
+		if err := checkDims("Biases", i, currLayer.Biases, loadedLayer.Biases); err != nil {
+			return err
 		}
 
-		// Check Bias Dimensions
-		if currLayer.Biases.rows != loadedLayer.Biases.rows ||
-			currLayer.Biases.cols != loadedLayer.Biases.cols {
-			return fmt.Errorf("layer %d bias shape mismatch: expected [%d, %d], got [%d, %d]",
-				i,
-				currLayer.Biases.rows, currLayer.Biases.cols,
-				loadedLayer.Biases.rows, loadedLayer.Biases.cols,
-			)
+		// 2. Attention Checks
+		if currLayer.ActType == ActAttention {
+			if err := checkDims("WQ", i, currLayer.WQ, loadedLayer.WQ); err != nil {
+				return err
+			}
+			if err := checkDims("WK", i, currLayer.WK, loadedLayer.WK); err != nil {
+				return err
+			}
+			if err := checkDims("WV", i, currLayer.WV, loadedLayer.WV); err != nil {
+				return err
+			}
+		}
+
+		// 3. Embedding Checks
+		if currLayer.ActType == ActEmbedding {
+			if err := checkDims("PosEnc", i, currLayer.PosEnc, loadedLayer.PosEnc); err != nil {
+				return err
+			}
 		}
 	}
 
 	// --- APPLICATION STEP ---
-	// If we passed all checks, it is safe to overwrite the weights
+	// Safe to overwrite now
 	for i := range nw.Layers {
 		loadedLayer := loadedData.LayerDatas[i]
 		currentLayer := nw.Layers[i]
 
+		// Standard
 		copy(currentLayer.Weights.data, loadedLayer.Weights.data)
 		copy(currentLayer.Biases.data, loadedLayer.Biases.data)
+
+		// Attention
+		if currentLayer.ActType == ActAttention {
+			// Because WQ, WK, WV were allocated in NewNetwork(), we just copy data
+			copy(currentLayer.WQ.data, loadedLayer.WQ.data)
+			copy(currentLayer.WK.data, loadedLayer.WK.data)
+			copy(currentLayer.WV.data, loadedLayer.WV.data)
+		}
+
+		// Embedding
+		if currentLayer.ActType == ActEmbedding {
+			copy(currentLayer.PosEnc.data, loadedLayer.PosEnc.data)
+		}
 	}
 
-	// Load Learning Rate
 	nw.LearningRate = loadedData.LearningRate
-
+	fmt.Println("Weights loaded successfully.")
 	return nil
 }
 
@@ -1369,6 +1725,40 @@ func (nw *NeuralNetwork) Predict(inputData []float64) (int, float64) {
 }
 
 // ------- MATRIX METHODS ------ //
+func (m *Matrix) GobEncode() ([]byte, error) {
+	w := new(bytes.Buffer)
+	encoder := gob.NewEncoder(w)
+	if err := encoder.Encode(m.rows); err != nil {
+		return nil, err
+	}
+	if err := encoder.Encode(m.cols); err != nil {
+		return nil, err
+	}
+	if err := encoder.Encode(m.data); err != nil {
+		return nil, err
+	}
+	return w.Bytes(), nil
+}
+
+func (m *Matrix) GobDecode(buf []byte) error {
+	r := bytes.NewBuffer(buf)
+	decoder := gob.NewDecoder(r)
+	if err := decoder.Decode(&m.rows); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&m.cols); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&m.data); err != nil {
+		return err
+	}
+
+	// Re-create the wrapper after loading data
+	m.dense = mat.NewDense(m.rows, m.cols, m.data)
+
+	return nil
+}
+
 func (m *Matrix) Randomize() {
 	scale := math.Sqrt(2.0 / float64(m.rows))
 	for i := range m.data {
@@ -1430,98 +1820,163 @@ func (m *Matrix) ApplyFunc(fn func(float64) float64) {
 // ------ ADAM OPTIMIZER METHODS ------ //
 // Update applies the Adam update rule to the network's weights and biases
 func (opt *AdamOptimizer) Update(nw *NeuralNetwork, grads []GradientSet) {
+	// 1. Increment Time Step
 	opt.timeStep++
+	t := float64(opt.timeStep)
 
-	// Pre-calculate bias correction factors for efficiency
-	// correction = 1 / (1 - beta^t)
-	beta1Corr := 1.0 / (1.0 - math.Pow(opt.cfg.Beta1, float64(opt.timeStep)))
-	beta2Corr := 1.0 / (1.0 - math.Pow(opt.cfg.Beta2, float64(opt.timeStep)))
+	// 2. Pre-calculate Correction Factors
+	// correction1 = 1 - beta1^t
+	// correction2 = 1 - beta2^t
+	correction1 := 1.0 - math.Pow(opt.cfg.Beta1, t)
+	correction2 := 1.0 - math.Pow(opt.cfg.Beta2, t)
 
-	lr := opt.cfg.LearningRate
-
-	for i, layer := range nw.Layers {
-		state := opt.layerStates[i]
-
-		// Update Weights
-		applyAdam(
-			layer.Weights.data,
-			grads[i].dW.data,
-			state.mW.data,
-			state.vW.data,
-			opt.cfg,
-			lr,
-			beta1Corr,
-			beta2Corr,
-		)
-
-		// Update Biases
-		applyAdam(
-			layer.Biases.data,
-			grads[i].db.data,
-			state.mB.data,
-			state.vB.data,
-			opt.cfg,
-			lr,
-			beta1Corr,
-			beta2Corr,
-		)
+	// Ensure State Storage exists
+	if len(opt.layerStates) != len(nw.Layers) {
+		opt.layerStates = make([]LayerState, len(nw.Layers))
 	}
-}
 
-// applyAdam performs the element-wise math over the flat slice.
-func applyAdam(
-	params []float64,
-	grads []float64,
-	m []float64,
-	v []float64,
-	cfg AdamConfig,
-	lr, beta1Corr, beta2Corr float64,
-) {
-	for i := range params {
-		g := grads[i]
+	// --- Helper Closure for Adam Math ---
+	// Applies update to a single parameter vector (weights, bias, or Q/K/V)
+	apply := func(params, grads, m, v []float64) {
+		beta1 := opt.cfg.Beta1
+		beta2 := opt.cfg.Beta2
+		eps := opt.cfg.Epsilon
+		lr := opt.cfg.LearningRate
 
-		// 1. Update biased first moment estimate (Momentum)
-		// m_t = beta1 * m_{t-1} + (1 - beta1) * g
-		m[i] = cfg.Beta1*m[i] + (1.0-cfg.Beta1)*g
+		for i := range params {
+			g := grads[i]
 
-		// 2. Update biased second raw moment estimate (Velocity)
-		// v_t = beta2 * v_{t-1} + (1 - beta2) * g^2
-		v[i] = cfg.Beta2*v[i] + (1.0-cfg.Beta2)*(g*g)
+			// Update Moving Averages
+			// m_t = beta1 * m_{t-1} + (1 - beta1) * g
+			m[i] = beta1*m[i] + (1.0-beta1)*g
 
-		// 3. Compute bias-corrected moment estimates
-		mHat := m[i] * beta1Corr
-		vHat := v[i] * beta2Corr
+			// v_t = beta2 * v_{t-1} + (1 - beta2) * g^2
+			v[i] = beta2*v[i] + (1.0-beta2)*(g*g)
 
-		// 4. Update parameters
-		// theta = theta - lr * mHat / (sqrt(vHat) + epsilon)
-		params[i] -= lr * mHat / (math.Sqrt(vHat) + cfg.Epsilon)
+			// Bias Correction
+			mHat := m[i] / correction1
+			vHat := v[i] / correction2
+
+			// Update Parameters
+			// theta = theta - lr * mHat / (sqrt(vHat) + eps)
+			params[i] -= lr * mHat / (math.Sqrt(vHat) + eps)
+		}
+	}
+
+	// 3. Loop Layers
+	for i, layer := range nw.Layers {
+		state := &opt.layerStates[i]
+
+		// --- A. Handle Attention Layers (Q, K, V) ---
+		if layer.ActType == ActAttention {
+			// Initialize Attention States if needed
+			if state.mWQ == nil {
+				rows, cols := layer.WQ.rows, layer.WQ.cols
+				state.mWQ = NewMatrix(rows, cols)
+				state.vWQ = NewMatrix(rows, cols)
+				state.mWK = NewMatrix(rows, cols)
+				state.vWK = NewMatrix(rows, cols)
+				state.mWV = NewMatrix(rows, cols)
+				state.vWV = NewMatrix(rows, cols)
+			}
+
+			// Apply Adam to Q, K, V
+			// Note: We use layer.dWQ (Accumulated Master Gradients)
+			apply(layer.WQ.data, layer.dWQ.data, state.mWQ.data, state.vWQ.data)
+			apply(layer.WK.data, layer.dWK.data, state.mWK.data, state.vWK.data)
+			apply(layer.WV.data, layer.dWV.data, state.mWV.data, state.vWV.data)
+		}
+
+		// --- B. Handle Standard Weights (Dense / Embedding / Projection) ---
+		if state.mW == nil {
+			state.mW = NewMatrix(layer.Weights.rows, layer.Weights.cols)
+			state.vW = NewMatrix(layer.Weights.rows, layer.Weights.cols)
+			state.mB = NewMatrix(layer.Biases.rows, layer.Biases.cols)
+			state.vB = NewMatrix(layer.Biases.rows, layer.Biases.cols)
+		}
+
+		// Apply to Weights (All layers have Weights)
+		apply(layer.Weights.data, grads[i].dW.data, state.mW.data, state.vW.data)
+
+		// Apply to Biases (Embeddings usually don't have bias updates)
+		if layer.ActType != ActEmbedding {
+			apply(layer.Biases.data, grads[i].db.data, state.mB.data, state.vB.data)
+		}
 	}
 }
 
 // ------ MOMENTUM OPTIMIZER METHODS ------ //
 func (opt *MomentumOptimizer) Update(nw *NeuralNetwork, grads []GradientSet) {
+	// 1. Initialize State if needed
+	if len(opt.layerStates) != len(nw.Layers) {
+		opt.layerStates = make([]*LayerState, len(nw.Layers))
+	}
+
+	// Helper closure to apply Momentum:
+	// v = mu * v - lr * grad
+	// w = w + v
+	applyMomentum := func(params, grads, velocity []float64) {
+		for i := range params {
+			// Update Velocity
+			velocity[i] = (opt.Mu * velocity[i]) - (opt.LearningRate * grads[i])
+			// Update Parameter
+			params[i] += velocity[i]
+		}
+	}
+
 	for i, layer := range nw.Layers {
-		vW := opt.velocities[i][0].dW.data
-		vB := opt.velocities[i][0].db.data
-		dW := grads[i].dW.data
-		db := grads[i].db.data
+		if opt.layerStates[i] == nil {
+			opt.layerStates[i] = &LayerState{}
+		}
+		state := opt.layerStates[i]
 
-		// Update Velocity: v = mu*v - lr*grad
-		floats.Scale(opt.Mu, vW)
-		floats.AddScaled(vW, -opt.LearningRate, dW)
+		// --- A. Handle Attention Layers (Q, K, V) ---
+		if layer.ActType == ActAttention {
+			// Ensure Velocity Matrices exist
+			if state.mWQ == nil {
+				r, c := layer.WQ.rows, layer.WQ.cols
+				// We use mW fields to store Velocity for consistency with LayerState struct
+				state.mWQ = NewMatrix(r, c)
+				state.mWK = NewMatrix(r, c)
+				state.mWV = NewMatrix(r, c)
+			}
 
-		floats.Scale(opt.Mu, vB)
-		floats.AddScaled(vB, -opt.LearningRate, db)
+			// Apply to Q, K, V using the MASTER accumulated gradients (layer.dWQ, etc.)
+			applyMomentum(layer.WQ.data, layer.dWQ.data, state.mWQ.data)
+			applyMomentum(layer.WK.data, layer.dWK.data, state.mWK.data)
+			applyMomentum(layer.WV.data, layer.dWV.data, state.mWV.data)
+		}
 
-		// Update Weights: W = W + v
-		floats.Add(layer.Weights.data, vW)
-		floats.Add(layer.Biases.data, vB)
+		// --- B. Handle Standard Weights (Dense / Embedding / Projection) ---
+		if state.mW == nil {
+			state.mW = NewMatrix(layer.Weights.rows, layer.Weights.cols)
+			state.mB = NewMatrix(layer.Biases.rows, layer.Biases.cols)
+		}
+
+		// Update Weights (All layers)
+		applyMomentum(layer.Weights.data, grads[i].dW.data, state.mW.data)
+
+		// Update Biases (Skip for Embedding as they are usually unused/fixed)
+		if layer.ActType != ActEmbedding {
+			applyMomentum(layer.Biases.data, grads[i].db.data, state.mB.data)
+		}
 	}
 }
 
 // ------ SGD OPTIMIZER METHODS ------ //
 func (opt *SGDOptimizer) Update(nw *NeuralNetwork, grads []GradientSet) {
 	for i, layer := range nw.Layers {
+		// 1. Update Attention Matrices (Q, K, V)
+		if layer.ActType == ActAttention {
+			// Now layer.dWQ contains the averaged gradients from all workers
+			lr := opt.LearningRate // Use Optimizer's LR
+
+			floats.AddScaled(layer.WQ.data, -lr, layer.dWQ.data)
+			floats.AddScaled(layer.WK.data, -lr, layer.dWK.data)
+			floats.AddScaled(layer.WV.data, -lr, layer.dWV.data)
+
+			// Note: layer.Weights (Projector) is updated in step 2 below
+		}
 		// Simple update: W = W - (lr * gradient)
 		floats.AddScaled(layer.Weights.data, -opt.LearningRate, grads[i].dW.data)
 		floats.AddScaled(layer.Biases.data, -opt.LearningRate, grads[i].db.data)
@@ -1611,6 +2066,36 @@ func Gather(
 
 		copy(destX.data[dstStart:dstEnd], globalX[srcStart:srcEnd])
 	}
+}
+
+// MakePositionalEncoding creates a flattened vector of size [ContextLen * EmbedDim]
+// containing the standard sinusoidal timing signals.
+func MakePositionalEncoding(contextLen, embedDim int) []float64 {
+	pe := make([]float64, contextLen*embedDim)
+
+	for pos := 0; pos < contextLen; pos++ {
+		for i := 0; i < embedDim; i++ {
+			// Standard Formula:
+			// PE(pos, 2i)   = sin(pos / 10000^(2i/d_model))
+			// PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+
+			exponent := float64(2*(i/2)) / float64(embedDim)
+			divTerm := math.Pow(10000.0, exponent)
+			val := float64(pos) / divTerm
+
+			var encoding float64
+			if i%2 == 0 {
+				encoding = math.Sin(val)
+			} else {
+				encoding = math.Cos(val)
+			}
+
+			// Map 2D [pos, i] to 1D flat index
+			idx := (pos * embedDim) + i
+			pe[idx] = encoding
+		}
+	}
+	return pe
 }
 
 func Relu(x float64) float64 {
