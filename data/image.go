@@ -1,40 +1,39 @@
 package data
 
 import (
-	"image/jpeg"
+	"image"
 	"os"
+
+	"golang.org/x/image/draw"
 )
 
-// convertJpg1D reads an image file, converts to grayscale if needed,
-// flattens it row-major, and returns []float64
-func convertJpg1D(path string) ([]float64, error) {
+// Convert image of any size to grayscale 1D float64 slice
+func convertJpg1D(path string, targetW, targetH int) ([]float64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	img, err := jpeg.Decode(f)
+	src, _, err := image.Decode(f)
 	if err != nil {
 		return nil, err
 	}
 
-	bounds := img.Bounds()
-	w, h := bounds.Dx(), bounds.Dy()
+	// Resize to 28x28 (or whatever the network expects)
+	dst := image.NewRGBA(image.Rect(0, 0, targetW, targetH))
+	draw.CatmullRom.Scale(dst, dst.Rect, src, src.Bounds(), draw.Over, nil)
 
-	out := make([]float64, 0, w*h)
+	out := make([]float64, 0, targetW*targetH)
+	bounds := dst.Bounds()
 
-	for y := range h {
-		for x := range w {
-			r, g, b, _ := img.At(x, y).RGBA()
-
-			gray := 0.299*float64(r>>8) +
-				0.587*float64(g>>8) +
-				0.114*float64(b>>8)
-
-			out = append(out, gray)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r, g, b, _ := dst.At(x, y).RGBA()
+			// Standard Grayscale formula
+			gray := 0.299*float64(r>>8) + 0.587*float64(g>>8) + 0.114*float64(b>>8)
+			out = append(out, gray) // Returns 0-255 range
 		}
 	}
-
 	return out, nil
 }
