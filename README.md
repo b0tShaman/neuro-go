@@ -4,6 +4,20 @@
 
 This project investigates the performance characteristics of synchronous data parallelism within a garbage-collected environment. The primary design goal is the elimination of runtime memory allocations during the training loop ("zero-allocation") to mitigate Garbage Collector (GC) latency and maximize CPU cache locality through flattened memory layouts.
 
+## Performance Benchmarks
+
+Training performance on the MNIST dataset (5 Epochs, Momentum Optimizer).
+
+| Device | Specifications | Training Time | Accuracy | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **MacBook Pro** | Apple M4 Pro (14-Core, 24GB RAM) | **1.00 s** | 97.42% | **5.9x** |
+| **Windows PC** | Intel Core i7, 8GB RAM | 5.89 s | 97.37% | 1x |
+
+
+![Demo](assets/demo.gif)
+
+---
+
 ## Project Overview
 
 Standard deep learning implementations often rely on external C/C++ bindings (e.g., BLAS, CUDA). `neuro-go` explores a pure Go approach, leveraging Go's native concurrency primitives (`goroutines`, `channels`, `sync`) to implement a distributed-memory style training architecture on a single shared-memory machine.

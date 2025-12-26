@@ -3,12 +3,14 @@ package data
 import (
 	"image"
 	"os"
+	_ "image/jpeg" // Essential: Registers JPEG format
+    _ "image/png"
 
 	"golang.org/x/image/draw"
 )
 
 // Convert image of any size to grayscale 1D float64 slice
-func convertJpg1D(path string, targetW, targetH int) ([]float64, error) {
+func ConvertJpg1D(path string, targetW, targetH int) ([]float64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
