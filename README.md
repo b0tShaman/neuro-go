@@ -83,16 +83,16 @@ The network implements the following standard components:
 
 ### Prerequisites
 * Go 1.20 or higher.
-* MNIST training data (`mnist_train.csv`) located in the project root.
+* MNIST training data (`mnist_train.csv.zip`) located in the project root.
 
 ### Installation
 ```bash
-git clone [https://github.com/b0tShaman/neuro-go.git](https://github.com/b0tShaman/neuro-go.git)
+git clone https://github.com/b0tShaman/neuro-go.git
 cd neuro-go
 ```
 ### Execution
 To initiate training:
 
 ```bash
-go run main.go
+go run .
 ```
