@@ -1,6 +1,6 @@
 # neuro-go
 
-**neuro-go** is an implementation of a fully connected Deep Neural Network (DNN) written in Go.
+**neuro-go** is a high-performance Deep Learning framework written in Go.
 
 This project investigates the performance characteristics of synchronous data parallelism within a garbage-collected environment. The primary design goal is the elimination of runtime memory allocations during the training loop ("zero-allocation") to mitigate Garbage Collector (GC) latency and maximize CPU cache locality through flattened memory layouts.
 
@@ -20,7 +20,7 @@ Training performance on the MNIST dataset (5 Epochs, Momentum Optimizer).
 
 ## Project Overview
 
-Standard deep learning implementations often rely on external C/C++ bindings (e.g., BLAS, CUDA). `neuro-go` explores a pure Go approach, leveraging Go's native concurrency primitives (`goroutines`, `channels`, `sync`) to implement a distributed-memory style training architecture on a single shared-memory machine.
+Standard deep learning implementations often rely on external C/C++ bindings (e.g., BLAS, CUDA). `neuro-go` utilizes `gonum` for high-performance matrix operations, leveraging Go's native concurrency primitives (`goroutines` & `sync`) to implement a distributed-memory style training architecture on a single shared-memory machine.
 
 ### Core Objectives
 1.  **Memory Optimization:** Implementation of a custom linear algebra engine utilizing 1D slice backing arrays to ensure row-major cache locality.
