@@ -1,6 +1,6 @@
 # neuro-go
 
-**neuro-go** is a concurrent implementation of a fully connected Deep Neural Network (DNN) written in Go.
+**neuro-go** is an implementation of a fully connected Deep Neural Network (DNN) written in Go.
 
 This project investigates the performance characteristics of synchronous data parallelism within a garbage-collected environment. The primary design goal is the elimination of runtime memory allocations during the training loop ("zero-allocation") to mitigate Garbage Collector (GC) latency and maximize CPU cache locality through flattened memory layouts.
 
